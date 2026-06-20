@@ -79,9 +79,9 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.8", layout="wide")
-st.title("📈 强势股情绪逃顶系统 v3.8")
-st.caption("🚀 新增功能：回测引擎支持 `<=2.0` 安全区做多胜率统计，智能反转计算逻辑。")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.9", layout="wide")
+st.title("📈 强势股情绪逃顶系统 v3.9")
+st.caption("🚀 终极回测版：支持 `>=高危` 逃顶胜率，以及 `<=2分`、`==0分` 极佳安全买点做多胜率的双向历史推演。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -330,7 +330,7 @@ def highlight_suspended(row):
     return [''] * len(row)
 
 # ================= 5. UI 呈现 =================
-tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：情绪预警", "⚡ 三阶段：指令与热度", "⏱️ A股特化向量回测"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：情绪预警", "⚡ 三阶段：指令与热度", "⏱️ 核心：全景向量回测"])
 
 with tab1:
     st.subheader("核心指标：寻找平稳高动量 (已过滤停牌/次新，异常标的自动垫底)")
@@ -408,21 +408,23 @@ with tab4:
     st.subheader("历史信号多维成效测算（支持双向验证）")
     
     col_a, col_b = st.columns(2)
-    # 核心更新：加入安全区测试选项
+    # 核心更新：加入 0分 选项
     bt_score_threshold = col_a.selectbox("选择回测信号触发条件：", [
         "满分 6.5 (史诗级断头/炸板)", 
         ">= 4.0分 (断板退潮/弱承接)", 
         ">= 2.5分 (温和预警)",
-        "<= 2.0分 (安全持仓/低风险)"
+        "<= 2.0分 (安全持仓/低风险)",
+        "== 0.0分 (完美安全/零风险绝佳点)"
     ])
     bt_period = col_b.radio("观察信号触发后表现窗口：", [3, 5, 10], index=1, horizontal=True)
     
-    is_safe_test = "<=" in bt_score_threshold
+    is_safe_test = "<=" in bt_score_threshold or "==" in bt_score_threshold
     
     if "6.5" in bt_score_threshold: bt_thresh_val = 6.5
     elif "4.0" in bt_score_threshold: bt_thresh_val = 4.0
     elif "2.5" in bt_score_threshold: bt_thresh_val = 2.5
-    else: bt_thresh_val = 2.0
+    elif "2.0" in bt_score_threshold: bt_thresh_val = 2.0
+    else: bt_thresh_val = 0.0
     
     st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **[{bt_score_threshold}]** 后 `{bt_period}` 个周期的表现。系统已开启冷却期机制以防重复计算。")
     
@@ -477,8 +479,9 @@ with tab4:
                 scores = np.where(fatal_diverge, 6.5, scores)
                 scores = np.clip(scores, 0, 6.5)
                 
-                # 核心更新：反转过滤逻辑
-                if is_safe_test: signals = scores <= bt_thresh_val
+                # 核心更新：0分 精确匹配
+                if "==" in bt_score_threshold: signals = scores == 0.0
+                elif "<=" in bt_score_threshold: signals = scores <= bt_thresh_val
                 elif bt_thresh_val == 6.5: signals = scores >= 6.5
                 else: signals = scores >= bt_thresh_val
                     
@@ -499,10 +502,10 @@ with tab4:
         if bt_results:
             bt_df = pd.DataFrame(bt_results)
             
-            # 核心更新：反转胜率统计口径
+            # 自动切换指标提示语
             if is_safe_test:
                 success_count = len(bt_df[bt_df[f'{bt_period}周期后表现'] > 0])
-                metric_label = f"做多胜率 (发出低风险信号后确实上涨的比例)"
+                metric_label = f"做多胜率 (发出低风险/零风险信号后确实上涨的比例)"
             else:
                 success_count = len(bt_df[bt_df[f'{bt_period}周期后表现'] < 0]) 
                 metric_label = f"防守胜率 (发出高危信号后确实下跌避开回调的比例)"
