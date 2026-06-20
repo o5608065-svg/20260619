@@ -1,12 +1,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import datetime
 import json
 import os
 import shutil
 import time
+import efinance as ef  # 👈 全新引入：东方财富数据接口
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 1. 强健的工程模块：JSON备份、映射与重试装饰器 =================
@@ -78,14 +78,15 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.2", layout="wide")
-st.title("📈 强势股自适应逃顶择时系统 v3.2")
-st.caption("新增：多周期回测、停牌过滤、自然语言添加，以及【双击内联编辑股票别名】功能")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.3", layout="wide")
+st.title("📈 强势股自适应逃顶择时系统 v3.3")
+st.caption("🔥 全新升级：彻底弃用雅虎，采用【东方财富】数据引擎，永不封禁IP，原生精准成交额！")
 
 st.sidebar.header("⚙️ 引擎设置")
 
 interval_option = st.sidebar.selectbox("K线级别", ["1d (日线)", "60m (小时线)", "30m (半小时)"])
-interval_map = {"1d (日线)": "1d", "60m (小时线)": "60m", "30m (半小时)": "30m"}
+# efinance的级别代号: 101是日线，60是60分钟，30是30分钟
+interval_map = {"1d (日线)": 101, "60m (小时线)": 60, "30m (半小时)": 30}
 interval = interval_map[interval_option]
 
 lookback_days = st.sidebar.slider("拉取回溯天数", 200, 730, 400)
@@ -118,31 +119,47 @@ if st.sidebar.button("确认移除", use_container_width=True) and to_remove:
 
 tickers = list(dict.fromkeys(st.session_state.watchlist + [benchmark]))
 
-# ================= 3. 异步数据拉取与清洗引擎 =================
+# ================= 3. 异步数据拉取引擎 (彻底剥离雅虎，拥抱东方财富) =================
 @retry_on_exception(retries=3)
-def fetch_single_ticker(ticker, start, end, inv):
-    df = yf.download(ticker, start=start, end=end, interval=inv, auto_adjust=True, progress=False)
-    df.dropna(subset=['Close', 'Volume'], inplace=True)
-    if df.empty: return ticker, pd.DataFrame()
+def fetch_single_ticker(ticker, start, end, klt):
+    # 剥离代码后缀，使其适配东方财富的智能搜索 (如: 600519.SS -> 600519)
+    if ticker == "000300.SS": clean_ticker = "沪深300"
+    elif ticker == "^HSI": clean_ticker = "恒生指数"
+    else: clean_ticker = ticker.split('.')[0]
     
-    if isinstance(df.columns, pd.MultiIndex):
-        df = pd.DataFrame({'Open': df['Open'][ticker], 'High': df['High'][ticker], 'Low': df['Low'][ticker], 'Close': df['Close'][ticker], 'Volume': df['Volume'][ticker]})
-    else:
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+    start_str = start.strftime("%Y%m%d")
+    end_str = end.strftime("%Y%m%d")
+    
+    # 核心：调用 efinance 获取东方财富行情 (默认包含前复权)
+    df = ef.stock.get_quote_history(clean_ticker, beg=start_str, end=end_str, klt=klt)
+    if df is None or df.empty: return ticker, pd.DataFrame()
+    
+    # 将中文列名映射为量化标准英文列名
+    df = df.rename(columns={
+        '日期': 'Date', '开盘': 'Open', '收盘': 'Close', 
+        '最高': 'High', '最低': 'Low', '成交量': 'Volume', '成交额': 'DollarVolume'
+    })
+    
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.set_index('Date', inplace=True)
+    
+    # 清理空值并强制转换为数值类型
+    df.dropna(subset=['Close', 'Volume'], inplace=True)
+    for col in ['Open', 'Close', 'High', 'Low', 'Volume', 'DollarVolume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
         
-    df = df[df['High'] != df['Low']]
-    df['DollarVolume'] = df['Close'] * df['Volume'] 
+    df = df[df['High'] != df['Low']] # 过滤全天停牌或一字死板的数据
     return ticker, df
 
 @st.cache_data(ttl=900)
-def fetch_all_data(tickers_list, days, inv):
+def fetch_all_data(tickers_list, days, inv_code):
     end_date = datetime.date.today() + datetime.timedelta(days=1)
     start_date = end_date - datetime.timedelta(days=days)
     data_dict = {}
     
-    with st.spinner('🚀 正在启用线程池异步并发拉取复权行情...'):
+    with st.spinner('🚀 正在连接东方财富源，异步拉取全市场数据...'):
         with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(fetch_single_ticker, t, start_date, end_date, inv) for t in tickers_list]
+            futures = [executor.submit(fetch_single_ticker, t, start_date, end_date, inv_code) for t in tickers_list]
             for future in as_completed(futures):
                 ticker, df = future.result()
                 if not df.empty: data_dict[ticker] = df
@@ -150,7 +167,7 @@ def fetch_all_data(tickers_list, days, inv):
 
 data_dict = fetch_all_data(tickers, lookback_days, interval)
 if not data_dict:
-    st.error("无法获取数据，请检查网络或回溯天数。")
+    st.error("数据拉取失败。如果重试依然无效，请检查网络或更换回溯周期。")
     st.stop()
 
 bm_returns = data_dict[benchmark]['Close'].pct_change() if benchmark in data_dict else None
@@ -228,6 +245,7 @@ def run_phase_2(data_dict, phase1_df, window):
         acc_threshold = df['acc'].rolling(history_window).quantile(0.90).iloc[-1]
         w_acc = df['acc'].iloc[-1] > (acc_threshold if pd.notna(acc_threshold) else 0.05)
         
+        # 直接使用东方财富原生的精准 DollarVolume (成交额)
         vol_pct = df['DollarVolume'].rolling(history_window).apply(
             lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
         w_crowd = vol_pct > param_crowd_pct
@@ -284,7 +302,6 @@ with tab1:
     
     phase1_df = run_phase_1(data_dict, param_window)
     
-    # 动态捕获并保存单元格编辑
     def on_name_edit():
         changes = st.session_state.get("phase1_editor", {}).get("edited_rows", {})
         if changes:
@@ -293,7 +310,7 @@ with tab1:
                 if "名称" in edit_dict:
                     ticker = phase1_df.iloc[row_idx]['代码']
                     new_name = edit_dict["名称"].strip()
-                    if new_name: # 防止改为空名称
+                    if new_name: 
                         st.session_state.custom_names[ticker] = new_name
                         is_changed = True
             if is_changed:
@@ -304,21 +321,19 @@ with tab1:
                    '超额强度(RS)': lambda x: f"{x:.4f}" if isinstance(x, float) and pd.notna(x) else x,
                    '风险调整动量(RAM)': lambda x: f"{x:.4f}" if isinstance(x, float) and pd.notna(x) else x}
     
-    # 获取除“名称”之外的所有列进行锁定
     locked_cols = [col for col in phase1_df.columns if col != '名称']
     
-    # 替换 st.dataframe 为交互性更强的 st.data_editor
     st.data_editor(
         phase1_df.style.apply(highlight_suspended, axis=1).format(format_dict),
-        disabled=locked_cols, # 锁定除名称外的所有列，防止误改数据
+        disabled=locked_cols,
         use_container_width=True,
         hide_index=True,
         key="phase1_editor",
-        on_change=on_name_edit # 绑定修改回调
+        on_change=on_name_edit 
     )
 
 with tab2:
-    st.subheader(f"多维高危预警与客观形态分析 (周期: {interval})")
+    st.subheader(f"多维高危预警与客观形态分析 (周期: {interval_option})")
     phase2_df, raw_dfs = run_phase_2(data_dict, phase1_df, param_window)
     st.dataframe(phase2_df.style.apply(highlight_suspended, axis=1).background_gradient(subset=['综合高危得分(满分6.5)'], cmap='Reds', vmin=0, vmax=6.5), use_container_width=True)
     
