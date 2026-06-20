@@ -8,8 +8,6 @@ import os
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
 # ================= 1. 强健的工程模块：JSON备份与重试装饰器 =================
 WATCHLIST_FILE = "watchlist.json"
@@ -52,7 +50,7 @@ def retry_on_exception(retries=3, delay=1):
                 except Exception as e:
                     if i == retries - 1:
                         return pd.DataFrame()
-                    time.append(delay)
+                    time.sleep(delay)
             return pd.DataFrame()
         return wrapper
     return decorator
@@ -65,7 +63,7 @@ def get_stock_name(ticker): return st.session_state.custom_names.get(ticker, tic
 
 # ================= 2. 页面与侧边栏动态参数 =================
 st.set_page_config(page_title="全天候量化逃顶系统 v2.0", layout="wide")
-st.title("📈 强势股逃顶择时与共振网络系统 v2.0")
+st.title("📈 强势股逃顶择时量化系统 v2.0")
 
 st.sidebar.header("⚙️ 动态参数与引擎设置")
 
@@ -207,7 +205,7 @@ def run_phase_2(data_dict, selected_tickers, window):
         # 加权打分
         score = (w_diverge * 2) + (w_str * 1.5) + (w_acc * 1) + (w_crowd * 1) + (w_vol * 1)
         
-        raw_signals[ticker] = df # 保存计算后DF传给绘图用
+        raw_signals[ticker] = df 
         results.append({
             '代码': ticker, '名称': get_stock_name(ticker), 
             '加速率': f"{acc:.3f}", '拥挤特征': crowd_type, '波动比': f"{vol_ratio:.2f}",
@@ -216,8 +214,8 @@ def run_phase_2(data_dict, selected_tickers, window):
         })
     return pd.DataFrame(results), raw_signals
 
-# ================= 5. UI 呈现与高级功能 =================
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 阶段一：选股与超额", "🕵️ 阶段二：加权预警", "⚡ 阶段三：执行与崩塌监测", "🕯️ 独立K线复盘", "⏱️ 信号回溯测算"])
+# ================= 5. UI 呈现 =================
+tab1, tab2, tab3, tab4 = st.tabs(["📊 阶段一：选股与超额", "🕵️ 阶段二：加权预警", "⚡ 阶段三：执行与崩塌监测", "⏱️ 信号回溯测算"])
 
 with tab1:
     st.subheader("核心指标：寻找平稳高动量、具有大盘超额收益的标的")
@@ -257,37 +255,6 @@ with tab3:
     st.dataframe(pd.DataFrame(orders), use_container_width=True)
 
 with tab4:
-    st.subheader("Plotly 交互式量价视界与预警标记")
-    st.caption("直观验证：高位滞涨、天量上影线、缩量阴跌等形态。")
-    plot_ticker = st.selectbox("选择要复盘的标的", phase2_df['代码'].tolist() if not phase2_df.empty else [])
-    
-    if plot_ticker and plot_ticker in raw_dfs:
-        plot_df = raw_dfs[plot_ticker].tail(100) # 取最近100根K线
-        
-        # 计算历史每个节点的量价背离点用于标注
-        vol_ma = plot_df['Volume'].rolling(param_window).mean()
-        surge_points = (plot_df['Volume'] > 2 * vol_ma) & (plot_df['CloseStr'] < 0.5)
-        
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
-        
-        # 绘制 K 线
-        fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K线'), row=1, col=1)
-        # 绘制均线
-        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Close'].rolling(param_window).mean(), line=dict(color='orange', width=1), name=f'MA{param_window}'), row=1, col=1)
-        
-        # 标记爆量滞涨高危点 (红点标记在最高价上方)
-        danger_x = plot_df.index[surge_points]
-        danger_y = plot_df['High'][surge_points] * 1.02 # 高于均价2%处画点
-        fig.add_trace(go.Scatter(x=danger_x, y=danger_y, mode='markers', marker=dict(color='red', size=10, symbol='circle'), name='致命背离预警'), row=1, col=1)
-
-        # 绘制成交量
-        colors = ['red' if close < open_p else 'green' for close, open_p in zip(plot_df['Close'], plot_df['Open'])]
-        fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
-        
-        fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"{get_stock_name(plot_ticker)} ({plot_ticker}) 量价结构分析", template='plotly_dark')
-        st.plotly_chart(fig, use_container_width=True)
-
-with tab5:
     st.subheader("简易胜率回溯测算 (历史红灯预警的后续表现)")
     st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **致命背离预警** 后 5 个周期的涨跌情况。")
     if st.button("▶️ 开始回溯计算"):
