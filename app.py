@@ -79,9 +79,9 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.9", layout="wide")
-st.title("📈 强势股情绪逃顶系统 v3.9")
-st.caption("🚀 终极回测版：支持 `>=高危` 逃顶胜率，以及 `<=2分`、`==0分` 极佳安全买点做多胜率的双向历史推演。")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.10", layout="wide")
+st.title("📈 强势股情绪逃顶系统 v3.10")
+st.caption("🚀 终极回测版：支持 1 日（次日）溢价/核按钮测试，精确检验超短线接力胜率。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -408,7 +408,6 @@ with tab4:
     st.subheader("历史信号多维成效测算（支持双向验证）")
     
     col_a, col_b = st.columns(2)
-    # 核心更新：加入 0分 选项
     bt_score_threshold = col_a.selectbox("选择回测信号触发条件：", [
         "满分 6.5 (史诗级断头/炸板)", 
         ">= 4.0分 (断板退潮/弱承接)", 
@@ -416,7 +415,8 @@ with tab4:
         "<= 2.0分 (安全持仓/低风险)",
         "== 0.0分 (完美安全/零风险绝佳点)"
     ])
-    bt_period = col_b.radio("观察信号触发后表现窗口：", [3, 5, 10], index=1, horizontal=True)
+    # 核心更新：加入 1 日表现选项
+    bt_period = col_b.radio("观察信号触发后表现窗口：", [1, 3, 5, 10], index=2, horizontal=True)
     
     is_safe_test = "<=" in bt_score_threshold or "==" in bt_score_threshold
     
@@ -479,7 +479,6 @@ with tab4:
                 scores = np.where(fatal_diverge, 6.5, scores)
                 scores = np.clip(scores, 0, 6.5)
                 
-                # 核心更新：0分 精确匹配
                 if "==" in bt_score_threshold: signals = scores == 0.0
                 elif "<=" in bt_score_threshold: signals = scores <= bt_thresh_val
                 elif bt_thresh_val == 6.5: signals = scores >= 6.5
@@ -502,7 +501,6 @@ with tab4:
         if bt_results:
             bt_df = pd.DataFrame(bt_results)
             
-            # 自动切换指标提示语
             if is_safe_test:
                 success_count = len(bt_df[bt_df[f'{bt_period}周期后表现'] > 0])
                 metric_label = f"做多胜率 (发出低风险/零风险信号后确实上涨的比例)"
