@@ -53,8 +53,8 @@ def robust_save_json(file_path, data):
         if os.path.exists(file_path):
             shutil.copy(file_path, file_path + ".bak") 
         os.replace(tmp_path, file_path) 
-    except Exception as e:
-        pass # 云端静默处理非致命写入错误
+    except Exception:
+        pass 
 
 def retry_on_exception(retries=3, delay=1):
     def decorator(func):
@@ -79,9 +79,9 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.4", layout="wide")
-st.title("📈 强势股自适应逃顶择时系统 v3.4")
-st.caption("🛡️ 引擎升级：搭载高拟真防封锁（Anti-Ban）机制与智能并发限流，彻底解决云端IP阻断问题。")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.5", layout="wide")
+st.title("📈 强势股自适应逃顶择时系统 v3.5")
+st.caption("🚀 引擎升级：采用真实【换手率】作为拥挤度基准，支持多阈值分数历史向量化回测。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -119,8 +119,7 @@ if st.sidebar.button("确认移除", use_container_width=True) and to_remove:
 
 tickers = list(dict.fromkeys(st.session_state.watchlist + [benchmark]))
 
-# ================= 3. 带护甲的异步数据引擎 =================
-# 全局防封锁会话设置：伪装成真实的桌面端 Chrome 浏览器
+# ================= 3. 带护甲与换手率提取的异步数据引擎 =================
 global_session = requests.Session()
 global_session.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -130,13 +129,9 @@ global_session.headers.update({
 
 @retry_on_exception(retries=3, delay=2)
 def fetch_single_ticker(ticker, start, end, inv):
-    # 核心护甲机制：人为增加 0.2 到 1.5 秒的随机延迟，打破机器并发特征
     time.sleep(np.random.uniform(0.2, 1.5))
-    
-    # 将 session 传递给 yfinance，应用浏览器伪装
     df = yf.download(ticker, start=start, end=end, interval=inv, auto_adjust=True, session=global_session, progress=False)
     
-    # 处理不同版本 yfinance 返回的列结构
     if not df.empty and isinstance(df.columns, pd.MultiIndex):
         try:
             df = pd.DataFrame({'Open': df['Open'][ticker], 'High': df['High'][ticker], 'Low': df['Low'][ticker], 'Close': df['Close'][ticker], 'Volume': df['Volume'][ticker]})
@@ -145,9 +140,23 @@ def fetch_single_ticker(ticker, start, end, inv):
             
     df.dropna(subset=['Close', 'Volume'], inplace=True)
     if df.empty or len(df) < param_window * 3: return ticker, pd.DataFrame()
-    
     df = df[df['High'] != df['Low']]
-    df['DollarVolume'] = df['Close'] * df['Volume'] 
+    
+    # 核心升级：尝试提取总股本，计算真实换手率
+    try:
+        t_obj = yf.Ticker(ticker, session=global_session)
+        shares = t_obj.info.get('sharesOutstanding', None)
+    except Exception:
+        shares = None
+        
+    df['DollarVolume'] = df['Close'] * df['Volume']
+    if shares and shares > 0:
+        df['Crowd_Proxy'] = df['Volume'] / shares  # 真实换手率
+        df['Proxy_Type'] = '换手率'
+    else:
+        df['Crowd_Proxy'] = df['DollarVolume']     # 容灾降级：成交额
+        df['Proxy_Type'] = '成交额(降级)'
+        
     return ticker, df
 
 @st.cache_data(ttl=900)
@@ -156,8 +165,7 @@ def fetch_all_data(tickers_list, days, inv):
     start_date = end_date - datetime.timedelta(days=days)
     data_dict = {}
     
-    with st.spinner('🚀 正在启用防封锁机制，错峰拉取全市场数据 (大约需时10-20秒)...'):
-        # 核心护甲机制2：将极度激进的 max_workers=10 降低到 4，极大降低被瞬间熔断IP的概率
+    with st.spinner('🚀 正在启用防封锁机制并计算全市场换手率 (大约需时10-20秒)...'):
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = [executor.submit(fetch_single_ticker, t, start_date, end_date, inv) for t in tickers_list]
             for future in as_completed(futures):
@@ -232,12 +240,14 @@ def run_phase_2(data_dict, phase1_df, window):
         if '停牌' in status or '样本不足' in status:
             results.append({
                 '代码': ticker, '名称': get_stock_name(ticker), 
-                '加速异动': "-", '客观形态特征': status, '自适应波动比': "-",
+                '加速异动': "-", '拥挤指标基准': "-", '客观形态特征': status, '自适应波动比': "-",
                 '背离/破位': "-", '综合高危得分(满分6.5)': 0, '_sort_val': -1
             })
             continue
 
         df = data_dict[ticker].copy()
+        proxy_type = df['Proxy_Type'].iloc[-1]
+        
         df['ret'] = df['Close'].pct_change()
         df['5d_ret'] = df['Close'].pct_change(5)
         
@@ -245,7 +255,8 @@ def run_phase_2(data_dict, phase1_df, window):
         acc_threshold = df['acc'].rolling(history_window).quantile(0.90).iloc[-1]
         w_acc = df['acc'].iloc[-1] > (acc_threshold if pd.notna(acc_threshold) else 0.05)
         
-        vol_pct = df['DollarVolume'].rolling(history_window).apply(
+        # 统一使用 Crowd_Proxy (可能是换手率，也可能是降级的成交额) 计算拥挤度
+        vol_pct = df['Crowd_Proxy'].rolling(history_window).apply(
             lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
         w_crowd = vol_pct > param_crowd_pct
         
@@ -258,8 +269,8 @@ def run_phase_2(data_dict, phase1_df, window):
         str_3d = df['CloseStr'].rolling(3).mean().iloc[-1]
         w_str = str_3d < 0.4
         
-        dollar_vol_mean = df['DollarVolume'].rolling(window).mean().iloc[-1]
-        is_surge = df['DollarVolume'].iloc[-1] > (3 * dollar_vol_mean)
+        proxy_mean = df['Crowd_Proxy'].rolling(window).mean().iloc[-1]
+        is_surge = df['Crowd_Proxy'].iloc[-1] > (3 * proxy_mean)
         fatal_diverge = is_surge and (str_3d < 0.3 or df['ret'].iloc[-1] < -0.02)
         
         pattern_desc = "正常波动"
@@ -267,7 +278,7 @@ def run_phase_2(data_dict, phase1_df, window):
             tail_shadow = (df['High'].iloc[-1] - max(df['Open'].iloc[-1], df['Close'].iloc[-1])) / df['Close'].iloc[-1]
             if tail_shadow > 0.03: pattern_desc = "高位长影拒斥 📉"
             elif str_3d > 0.6: pattern_desc = "趋势放量冲刺 🚀"
-            else: pattern_desc = "放量滞涨/派发 ⚠️"
+            else: pattern_desc = "极端拥挤滞涨 ⚠️"
             
         if fatal_diverge: pattern_desc = "🛑 史诗级断头背离"
 
@@ -279,7 +290,9 @@ def run_phase_2(data_dict, phase1_df, window):
         raw_signals[ticker] = df 
         results.append({
             '代码': ticker, '名称': get_stock_name(ticker), 
-            '加速异动': "是" if w_acc else "否", '客观形态特征': pattern_desc, '自适应波动比': f"{df['vol_ratio'].iloc[-1]:.2f}",
+            '加速异动': "是" if w_acc else "否", 
+            '拥挤指标基准': f"✅{proxy_type}" if proxy_type == '换手率' else f"⚠️{proxy_type}",
+            '客观形态特征': pattern_desc, '自适应波动比': f"{df['vol_ratio'].iloc[-1]:.2f}",
             '背离/破位': "🔴 致命熔断" if fatal_diverge else "🟢 正常",
             '综合高危得分(满分6.5)': min(score, 6.5), '_sort_val': score
         })
@@ -293,7 +306,7 @@ def highlight_suspended(row):
     return [''] * len(row)
 
 # ================= 5. UI 呈现 =================
-tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：自适应预警", "⚡ 三阶段：指令与热度", "⏱️ 信号防守测算"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：自适应预警", "⚡ 三阶段：指令与热度", "⏱️ 核心：多档位历史回测"])
 
 with tab1:
     st.subheader("核心指标：寻找平稳高动量 (已过滤停牌/次新，异常标的自动垫底)")
@@ -368,33 +381,74 @@ with tab3:
     if orders: st.dataframe(pd.DataFrame(orders), use_container_width=True)
 
 with tab4:
-    st.subheader("历史极端熔断信号的防守成效测算")
-    bt_period = st.radio("选择防守表现统计窗口：", [3, 5, 10], index=1, horizontal=True, format_func=lambda x: f"观察信号触发后 {x} 个周期表现")
-    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **史诗级断头背离** 后 `{bt_period}` 个周期的跌幅情况。")
+    st.subheader("历史信号防守成效测算（向量化回测引擎）")
     
-    if st.button("▶️ 开始回溯计算", type="primary"):
+    col_a, col_b = st.columns(2)
+    bt_score_threshold = col_a.selectbox("选择回测信号触发条件：", ["满分 6.5 (史诗级熔断)", ">= 4.0分 (高度危险)", ">= 2.5分 (温和预警)"])
+    bt_period = col_b.radio("观察信号触发后跌幅窗口：", [3, 5, 10], index=1, horizontal=True)
+    
+    bt_thresh_val = 6.5 if "6.5" in bt_score_threshold else (4.0 if "4.0" in bt_score_threshold else 2.5)
+    
+    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **[{bt_score_threshold}]** 后 `{bt_period}` 个周期的表现。系统已开启冷却期机制（触发一次后冷却 {bt_period} 周期，避免重复统计连跌）。")
+    
+    if st.button("▶️ 开始全量回溯计算", type="primary"):
         bt_results = []
-        for ticker in phase1_df['代码'].tolist():
-            if ticker not in raw_dfs: continue
-            df_bt = raw_dfs[ticker].copy()
-            dollar_vol_mean = df_bt['DollarVolume'].rolling(param_window).mean()
-            str_3d = df_bt['CloseStr'].rolling(3).mean()
-            
-            signals = (df_bt['DollarVolume'] > 3 * dollar_vol_mean) & ((str_3d < 0.3) | (df_bt['ret'] < -0.02))
-            signal_dates = df_bt.index[signals]
-            
-            for date in signal_dates:
-                idx = df_bt.index.get_loc(date)
-                if idx + bt_period < len(df_bt): 
-                    price_at_signal = df_bt['Close'].iloc[idx]
-                    price_after = df_bt['Close'].iloc[idx + bt_period]
-                    ret_period = (price_after / price_at_signal) - 1
-                    bt_results.append({'代码': ticker, '名称': get_stock_name(ticker), '信号日期': date.strftime("%Y-%m-%d"), f'{bt_period}周期后表现': ret_period})
+        with st.spinner("正在后台进行向量化分数推演..."):
+            for ticker in phase1_df['代码'].tolist():
+                if ticker not in raw_dfs: continue
+                df_bt = raw_dfs[ticker].copy()
+                history_window = param_window * 5
+                
+                # 向量化还原历史每一天的得分
+                df_bt['5d_ret'] = df_bt['Close'].pct_change(5)
+                df_bt['acc'] = df_bt['5d_ret'] - df_bt['5d_ret'].rolling(param_window).mean()
+                acc_threshold = df_bt['acc'].rolling(history_window).quantile(0.90)
+                w_acc = df_bt['acc'] > acc_threshold.fillna(0.05)
+                
+                vol_pct = df_bt['Crowd_Proxy'].rolling(history_window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan)
+                w_crowd = vol_pct > param_crowd_pct
+                
+                df_bt['vol_ratio'] = df_bt['ret'].rolling(5).std() / (df_bt['ret'].rolling(param_window).std() + 1e-9)
+                vol_ratio_threshold = df_bt['vol_ratio'].rolling(history_window).quantile(0.90)
+                w_vol = df_bt['vol_ratio'] > vol_ratio_threshold.fillna(1.5)
+                
+                range_p = df_bt['High'] - df_bt['Low']
+                df_bt['CloseStr'] = np.where(range_p > 0, (df_bt['Close'] - df_bt['Low']) / range_p, 0.5)
+                str_3d = df_bt['CloseStr'].rolling(3).mean()
+                w_str = str_3d < 0.4
+                
+                proxy_mean = df_bt['Crowd_Proxy'].rolling(param_window).mean()
+                is_surge = df_bt['Crowd_Proxy'] > (3 * proxy_mean)
+                fatal_diverge = is_surge & ((str_3d < 0.3) | (df_bt['ret'] < -0.02))
+                
+                # 计算总分 (严格对应 Phase 2)
+                scores = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0) + ((is_surge & ~fatal_diverge) * 1.0)
+                scores = np.where(fatal_diverge, 6.5, scores)
+                scores = np.clip(scores, 0, 6.5)
+                
+                # 过滤出符合回测阈值的信号日期
+                if bt_thresh_val == 6.5: signals = scores >= 6.5
+                else: signals = scores >= bt_thresh_val
                     
+                signal_dates = df_bt.index[signals]
+                
+                # 提取表现并加入冷却期机制
+                last_idx = -999
+                for date in signal_dates:
+                    idx = df_bt.index.get_loc(date)
+                    if idx - last_idx < bt_period: continue # 冷却期机制，避免重复计算
+                    
+                    if idx + bt_period < len(df_bt): 
+                        price_at_signal = df_bt['Close'].iloc[idx]
+                        price_after = df_bt['Close'].iloc[idx + bt_period]
+                        ret_period = (price_after / price_at_signal) - 1
+                        bt_results.append({'代码': ticker, '名称': get_stock_name(ticker), '信号日期': date.strftime("%Y-%m-%d"), '触发得分': f"{scores[idx]:.1f}", f'{bt_period}周期后表现': ret_period})
+                        last_idx = idx # 更新最后一次触发的位置
+                        
         if bt_results:
             bt_df = pd.DataFrame(bt_results)
             success_avoid = len(bt_df[bt_df[f'{bt_period}周期后表现'] < 0]) 
-            st.metric(f"防守胜率 (发出熔断信号后 {bt_period} 周期确实下跌或震荡的比例)", f"{(success_avoid / len(bt_df)):.2%}", f"共发现 {len(bt_df)} 次历史极端信号")
+            st.metric(f"防守胜率 (发出信号后确实下跌或震荡避险成功的比例)", f"{(success_avoid / len(bt_df)):.2%}", f"全量历史共发现 {len(bt_df)} 次有效信号")
             st.dataframe(bt_df.style.format({f'{bt_period}周期后表现': '{:.2%}'}).background_gradient(subset=[f'{bt_period}周期后表现'], cmap='RdYlGn_r'), use_container_width=True)
         else:
-            st.info(f"所选周期内未触发极端熔断预警。这说明当前回溯期（{lookback_days}天）内，您的池子里未出现恶劣断头铡刀。")
+            st.info(f"在您选择的阈值 [{bt_score_threshold}] 下，未捕捉到任何历史信号。您可以尝试调低回测分数要求，或延长回溯天数。")
