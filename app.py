@@ -14,7 +14,6 @@ WATCHLIST_FILE = "watchlist.json"
 CUSTOM_NAMES_FILE = "custom_names.json"
 DEFAULT_WATCHLIST = ["NVDA", "AAPL", "600519.SS", "002594.SZ", "TSLA", "AMD", "0700.HK", "SPY"]
 
-# 新增：内置中英文/简称映射字典，实现零门槛添加
 STOCK_MAPPING = {
     "茅台": "600519.SS", "贵州茅台": "600519.SS",
     "英伟达": "NVDA", "苹果": "AAPL", "特斯拉": "TSLA", "微软": "MSFT",
@@ -23,7 +22,7 @@ STOCK_MAPPING = {
     "腾讯": "0700.HK", "腾讯控股": "0700.HK", "阿里": "BABA", "阿里巴巴": "BABA",
     "标普": "SPY", "标普500": "SPY", "纳指": "QQQ", "沪深300": "000300.SS"
 }
-# 反向映射用于默认名称显示
+
 TICKER_NAME_MAPPING = {v: k for k, v in STOCK_MAPPING.items()}
 TICKER_NAME_MAPPING.update({
     "NVDA": "英伟达", "AAPL": "苹果", "600519.SS": "贵州茅台", 
@@ -73,16 +72,15 @@ def retry_on_exception(retries=3, delay=1):
 if 'watchlist' not in st.session_state: st.session_state.watchlist = robust_load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
 if 'custom_names' not in st.session_state: st.session_state.custom_names = robust_load_json(CUSTOM_NAMES_FILE, {})
 
-# 升级：优先读取用户自定义名称 -> 其次读取内置中文映射 -> 最后退化为代码
 def get_stock_name(ticker): 
     if ticker in st.session_state.custom_names:
         return st.session_state.custom_names[ticker]
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.1", layout="wide")
-st.title("📈 强势股自适应逃顶择时系统 v3.1")
-st.caption("新增：多周期回测、停牌灰标过滤、最小数据校验、自然语言添加自选")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.2", layout="wide")
+st.title("📈 强势股自适应逃顶择时系统 v3.2")
+st.caption("新增：多周期回测、停牌过滤、自然语言添加，以及【双击内联编辑股票别名】功能")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -102,12 +100,10 @@ benchmark = bm_map[benchmark_ticker]
 
 st.sidebar.markdown("---")
 st.sidebar.header("📁 自选池管理")
-# 升级：支持中文简称无缝输入
 new_stock_input = st.sidebar.text_input("➕ 添加自选 (代码或中文简称):", placeholder="如: AAPL, 茅台, 英伟达")
 if st.sidebar.button("添加", use_container_width=True):
     if new_stock_input:
         raw_input = new_stock_input.strip()
-        # 匹配字典，匹配不到则默认当作标准代码大写
         mapped_ticker = STOCK_MAPPING.get(raw_input, raw_input.upper())
         if mapped_ticker not in st.session_state.watchlist:
             st.session_state.watchlist.append(mapped_ticker)
@@ -126,7 +122,6 @@ tickers = list(dict.fromkeys(st.session_state.watchlist + [benchmark]))
 @retry_on_exception(retries=3)
 def fetch_single_ticker(ticker, start, end, inv):
     df = yf.download(ticker, start=start, end=end, interval=inv, auto_adjust=True, progress=False)
-    # 彻底过滤空值
     df.dropna(subset=['Close', 'Volume'], inplace=True)
     if df.empty: return ticker, pd.DataFrame()
     
@@ -159,20 +154,17 @@ if not data_dict:
     st.stop()
 
 bm_returns = data_dict[benchmark]['Close'].pct_change() if benchmark in data_dict else None
-
-# 获取全市场最新的有效交易日（用于判定停牌）
 latest_market_date = max([df.index[-1] for df in data_dict.values() if not df.empty]) if data_dict else pd.Timestamp.now()
 
-# ================= 4. 核心计算模块 (增加空值、停牌和数据量校验) =================
+# ================= 4. 核心计算模块 =================
 def run_phase_1(data_dict, window):
     results = []
-    min_data_required = window * 5 # 计算历史分位数所需的最小数据量
+    min_data_required = window * 5 
     
     for ticker, df in data_dict.items():
         if ticker == benchmark: continue
         df = df.copy()
         
-        # 异常校验：数据不足
         if len(df) < min_data_required:
             results.append({
                 '代码': ticker, '名称': get_stock_name(ticker), '收盘价': np.nan,
@@ -181,7 +173,6 @@ def run_phase_1(data_dict, window):
             })
             continue
             
-        # 异常校验：近期停牌 (最新日期距离全市场最新交易日超过4天)
         if (latest_market_date - df.index[-1]).days > 4:
             results.append({
                 '代码': ticker, '名称': get_stock_name(ticker), '收盘价': df['Close'].iloc[-1],
@@ -190,7 +181,6 @@ def run_phase_1(data_dict, window):
             })
             continue
 
-        # 正常计算
         df['MOM'] = df['Close'] / df['Close'].shift(window) - 1
         df['daily_ret'] = df['Close'].pct_change()
         df['downside_ret'] = df['daily_ret'].clip(upper=0)
@@ -210,7 +200,6 @@ def run_phase_1(data_dict, window):
             '_sort_val': latest['RAM'], '状态': '🟢 交易中'
         })
         
-    # 根据隐藏分值排序，保证异常标的垫底
     df_res = pd.DataFrame(results).sort_values(by='_sort_val', ascending=False).drop(columns=['_sort_val']).reset_index(drop=True)
     return df_res
 
@@ -223,7 +212,6 @@ def run_phase_2(data_dict, phase1_df, window):
         status = row['状态']
         if ticker not in data_dict: continue
         
-        # 同步第一阶段的异常状态
         if '停牌' in status or '样本不足' in status:
             results.append({
                 '代码': ticker, '名称': get_stock_name(ticker), 
@@ -282,24 +270,52 @@ def run_phase_2(data_dict, phase1_df, window):
     df_res = pd.DataFrame(results).sort_values(by='_sort_val', ascending=False).drop(columns=['_sort_val']).reset_index(drop=True)
     return df_res, raw_signals
 
-# 样式高亮函数：对停牌和数据不足进行灰标淡化处理
 def highlight_suspended(row):
     if '停牌' in str(row.get('状态', '')) or '停牌' in str(row.get('客观形态特征', '')) or '不足' in str(row.get('状态', '')) or '不足' in str(row.get('客观形态特征', '')):
         return ['color: #888888; background-color: #2b2b2b'] * len(row)
     return [''] * len(row)
 
 # ================= 5. UI 呈现 =================
-tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与下行风险", "🕵️ 二阶段：自适应预警", "⚡ 三阶段：组合热度与指令", "⏱️ 信号防守测算"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：自适应预警", "⚡ 三阶段：指令与热度", "⏱️ 信号防守测算"])
 
 with tab1:
     st.subheader("核心指标：寻找平稳高动量 (已过滤停牌/次新，异常标的自动垫底)")
+    st.caption("💡 **操作指引：直接双击下方表格中的【名称】列即可手动修改别名，按回车(Enter)系统将自动记忆保存。**")
+    
     phase1_df = run_phase_1(data_dict, param_window)
-    # 使用自定义格式化逻辑，避免把字符串强转为浮点数报错
+    
+    # 动态捕获并保存单元格编辑
+    def on_name_edit():
+        changes = st.session_state.get("phase1_editor", {}).get("edited_rows", {})
+        if changes:
+            is_changed = False
+            for row_idx, edit_dict in changes.items():
+                if "名称" in edit_dict:
+                    ticker = phase1_df.iloc[row_idx]['代码']
+                    new_name = edit_dict["名称"].strip()
+                    if new_name: # 防止改为空名称
+                        st.session_state.custom_names[ticker] = new_name
+                        is_changed = True
+            if is_changed:
+                robust_save_json(CUSTOM_NAMES_FILE, st.session_state.custom_names)
+
     format_dict = {f'{param_window}日动量': lambda x: f"{x:.2%}" if isinstance(x, float) and pd.notna(x) else x,
                    '下行风险(Sortino)': lambda x: f"{x:.4f}" if isinstance(x, float) and pd.notna(x) else x,
                    '超额强度(RS)': lambda x: f"{x:.4f}" if isinstance(x, float) and pd.notna(x) else x,
                    '风险调整动量(RAM)': lambda x: f"{x:.4f}" if isinstance(x, float) and pd.notna(x) else x}
-    st.dataframe(phase1_df.style.apply(highlight_suspended, axis=1).format(format_dict), use_container_width=True)
+    
+    # 获取除“名称”之外的所有列进行锁定
+    locked_cols = [col for col in phase1_df.columns if col != '名称']
+    
+    # 替换 st.dataframe 为交互性更强的 st.data_editor
+    st.data_editor(
+        phase1_df.style.apply(highlight_suspended, axis=1).format(format_dict),
+        disabled=locked_cols, # 锁定除名称外的所有列，防止误改数据
+        use_container_width=True,
+        hide_index=True,
+        key="phase1_editor",
+        on_change=on_name_edit # 绑定修改回调
+    )
 
 with tab2:
     st.subheader(f"多维高危预警与客观形态分析 (周期: {interval})")
@@ -310,7 +326,6 @@ with tab3:
     st.subheader("组合全局监控与仓位指令")
     st.info("注：此处反映的是您当前【自定义选股池】整体资金出逃热度，不包含停牌及样本不足标的。")
     
-    # 过滤掉得分为0（异常标的）的股票，计算真实的活跃资金情绪
     valid_scores = phase2_df[phase2_df['综合高危得分(满分6.5)'] > 0]['综合高危得分(满分6.5)']
     avg_risk = valid_scores.mean() if not valid_scores.empty else 0
     pool_overheated = avg_risk > 3.5 
@@ -325,7 +340,7 @@ with tab3:
     orders = []
     for _, row in phase2_df.iterrows():
         score = row['综合高危得分(满分6.5)']
-        if score == 0: continue # 过滤掉停牌/异常的指令
+        if score == 0: continue 
         
         if pool_overheated:
             level, action, pos = "🚨 组合避险", "整体降仓防御", "10-20%"
@@ -340,8 +355,6 @@ with tab3:
 
 with tab4:
     st.subheader("历史极端熔断信号的防守成效测算")
-    
-    # 升级：增加回测周期动态选择
     bt_period = st.radio("选择防守表现统计窗口：", [3, 5, 10], index=1, horizontal=True, format_func=lambda x: f"观察信号触发后 {x} 个周期表现")
     st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **史诗级断头背离** 后 `{bt_period}` 个周期的跌幅情况。")
     
