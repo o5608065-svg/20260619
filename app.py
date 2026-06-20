@@ -79,9 +79,9 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.7 (A股专精版)", layout="wide")
-st.title("📈 强势股情绪逃顶系统 v3.7 (A股连板特化版)")
-st.caption("🇨🇳 核心升级：增加「涨停连板断板」监控、「炸板高开低走」提前预警、区分情绪放量与趋势放量，专治A股妖股核按钮。")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.8", layout="wide")
+st.title("📈 强势股情绪逃顶系统 v3.8")
+st.caption("🚀 新增功能：回测引擎支持 `<=2.0` 安全区做多胜率统计，智能反转计算逻辑。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -93,7 +93,6 @@ lookback_days = st.sidebar.slider("拉取回溯天数", 200, 730, 400)
 
 st.sidebar.subheader("系统参数 (自适应计算基准)")
 param_window = st.sidebar.number_input("动量与阈值基准周期", 10, 60, 20)
-# 核心下调：A股拥挤度阈值默认下调至0.82
 param_crowd_pct = st.sidebar.slider("基础拥挤度报警分位数", 0.70, 0.99, 0.82)
 
 benchmark_ticker = st.sidebar.selectbox("选择对标大盘基准", ["000300.SS (沪深300)", "SPY (标普500)", "^HSI (恒生指数)"])
@@ -128,12 +127,11 @@ if st.sidebar.button("确认移除", use_container_width=True) and to_remove:
 
 tickers = list(dict.fromkeys(st.session_state.watchlist + [benchmark]))
 
-# ================= 3. 带护甲与换手率提取的异步数据引擎 =================
+# ================= 3. 数据引擎 =================
 global_session = requests.Session()
 global_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Accept-Language": "en-US,en;q=0.9"
 })
 
 @retry_on_exception(retries=3, delay=2)
@@ -189,7 +187,7 @@ if not data_dict:
 bm_returns = data_dict[benchmark]['Close'].pct_change() if benchmark in data_dict else None
 latest_market_date = max([df.index[-1] for df in data_dict.values() if not df.empty]) if data_dict else pd.Timestamp.now()
 
-# ================= 4. 核心计算模块 (A股专精逻辑) =================
+# ================= 4. 核心计算模块 =================
 def run_phase_1(data_dict, window):
     results = []
     min_data_required = window * 5 
@@ -259,14 +257,12 @@ def run_phase_2(data_dict, phase1_df, window):
         df['ret'] = df['Close'].pct_change()
         df['5d_ret'] = df['Close'].pct_change(5)
         
-        # 1. 识别涨停连板 (采用 >=9% 作为涨停粗略判定，兼容主板与创业板高位)
         df['limit_up'] = df['ret'] >= 0.09
         df['streak'] = np.where(df['limit_up'], df['limit_up'].groupby((~df['limit_up']).cumsum()).cumcount() + 1, 0)
         
         was_consecutive_limit_up = df['streak'].iloc[-2] >= 2 if len(df) > 1 else False
         was_limit_up = df['streak'].iloc[-2] >= 1 if len(df) > 1 else False
         
-        # A股特殊规则：连板股的放量触发线从 3倍 下调至 2倍
         dynamic_surge_mul = 2.0 if was_limit_up else 3.0
         proxy_mean = df['Crowd_Proxy'].rolling(window).mean().iloc[-1]
         is_surge = df['Crowd_Proxy'].iloc[-1] > (dynamic_surge_mul * proxy_mean)
@@ -275,7 +271,6 @@ def run_phase_2(data_dict, phase1_df, window):
         acc_threshold = df['acc'].rolling(history_window).quantile(0.90).iloc[-1]
         w_acc = df['acc'].iloc[-1] > (acc_threshold if pd.notna(acc_threshold) else 0.05)
         
-        # A股特殊规则：连板股的拥挤度阈值强行下调至 0.75
         dynamic_crowd_pct = 0.75 if (was_consecutive_limit_up or df['streak'].iloc[-1] >= 2) else param_crowd_pct
         vol_pct = df['Crowd_Proxy'].rolling(history_window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
         w_crowd = vol_pct > dynamic_crowd_pct
@@ -284,23 +279,18 @@ def run_phase_2(data_dict, phase1_df, window):
         vol_ratio_threshold = df['vol_ratio'].rolling(history_window).quantile(0.90).iloc[-1]
         w_vol = df['vol_ratio'].iloc[-1] > (vol_ratio_threshold if pd.notna(vol_ratio_threshold) else 1.5)
         
-        # A股特殊规则：3日收盘价安全阈值从 0.4 上调至 0.5 (高位站不稳即看空)
         range_p = df['High'] - df['Low']
         df['CloseStr'] = np.where(range_p > 0, (df['Close'] - df['Low']) / range_p, 0.5)
         str_3d = df['CloseStr'].rolling(3).mean().iloc[-1]
         w_str = str_3d < 0.5 
         
-        # A股特殊规则：炸板回落与高开低走提前熔断
         open_high_go_low = (df['Open'].iloc[-1] > df['Close'].iloc[-2]) and (df['Close'].iloc[-1] < df['Open'].iloc[-1])
         blew_board = (df['High'].iloc[-1] / df['Close'].iloc[-2] - 1 >= 0.09) and (df['Close'].iloc[-1] < df['High'].iloc[-1])
         early_fatal = was_limit_up and (open_high_go_low or blew_board) and is_surge
         
         fatal_diverge = (is_surge and ((str_3d < 0.3) or (df['ret'].iloc[-1] < -0.02))) or early_fatal
         
-        # A股特殊规则：情绪接力放量滞涨 (涨幅为正但收窄，且留上影线放量)
         weak_relay = (df['ret'].iloc[-1] > 0) and (df['ret'].iloc[-1] < df['ret'].iloc[-2]) and (df['CloseStr'].iloc[-1] < 0.5) and is_surge
-        
-        # A股特殊规则：首次断板情绪核按钮
         break_board = was_consecutive_limit_up and not df['limit_up'].iloc[-1] and is_surge
         
         pattern_desc = "正常波动"
@@ -314,13 +304,12 @@ def run_phase_2(data_dict, phase1_df, window):
             elif str_3d > 0.6: pattern_desc = "趋势放量冲刺 🚀"
             else: pattern_desc = "极端拥挤滞涨 ⚠️"
 
-        # 计分系统重构
         if fatal_diverge: score = 6.5 
         else:
             score = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0)
             if is_surge and not fatal_diverge: score += 1.0 
-            if weak_relay: score += 1.0  # 弱承接独立惩罚
-            if break_board: score += 2.0 # 首次断板独立惩罚
+            if weak_relay: score += 1.0  
+            if break_board: score += 2.0 
             
         raw_signals[ticker] = df 
         results.append({
@@ -416,25 +405,35 @@ with tab3:
     if orders: st.dataframe(pd.DataFrame(orders), use_container_width=True)
 
 with tab4:
-    st.subheader("历史信号防守成效测算（A股复杂因子全量向量化引擎）")
+    st.subheader("历史信号多维成效测算（支持双向验证）")
     
     col_a, col_b = st.columns(2)
-    bt_score_threshold = col_a.selectbox("选择回测信号触发条件：", ["满分 6.5 (史诗级断头/炸板)", ">= 4.0分 (断板退潮/弱承接)", ">= 2.5分 (温和预警)"])
-    bt_period = col_b.radio("观察信号触发后跌幅窗口：", [3, 5, 10], index=1, horizontal=True)
+    # 核心更新：加入安全区测试选项
+    bt_score_threshold = col_a.selectbox("选择回测信号触发条件：", [
+        "满分 6.5 (史诗级断头/炸板)", 
+        ">= 4.0分 (断板退潮/弱承接)", 
+        ">= 2.5分 (温和预警)",
+        "<= 2.0分 (安全持仓/低风险)"
+    ])
+    bt_period = col_b.radio("观察信号触发后表现窗口：", [3, 5, 10], index=1, horizontal=True)
     
-    bt_thresh_val = 6.5 if "6.5" in bt_score_threshold else (4.0 if "4.0" in bt_score_threshold else 2.5)
+    is_safe_test = "<=" in bt_score_threshold
     
-    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **[{bt_score_threshold}]** 后 `{bt_period}` 个周期的表现。系统已开启冷却期机制，真实还原A股打板核按钮避险胜率。")
+    if "6.5" in bt_score_threshold: bt_thresh_val = 6.5
+    elif "4.0" in bt_score_threshold: bt_thresh_val = 4.0
+    elif "2.5" in bt_score_threshold: bt_thresh_val = 2.5
+    else: bt_thresh_val = 2.0
+    
+    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **[{bt_score_threshold}]** 后 `{bt_period}` 个周期的表现。系统已开启冷却期机制以防重复计算。")
     
     if st.button("▶️ 开始全量回溯计算", type="primary"):
         bt_results = []
-        with st.spinner("正在后台进行A股特化因子向量推演..."):
+        with st.spinner("正在后台进行向量推演..."):
             for ticker in phase1_df['代码'].tolist():
                 if ticker not in raw_dfs: continue
                 df_bt = raw_dfs[ticker].copy()
                 history_window = param_window * 5
                 
-                # A股向量化回测：精确重构连板、炸板、断板逻辑
                 df_bt['limit_up'] = df_bt['ret'] >= 0.09
                 df_bt['streak'] = df_bt['limit_up'].groupby((~df_bt['limit_up']).cumsum()).cumcount()
                 df_bt['streak'] = np.where(df_bt['limit_up'], df_bt['streak'] + 1, 0)
@@ -462,7 +461,7 @@ with tab4:
                 range_p = df_bt['High'] - df_bt['Low']
                 df_bt['CloseStr'] = np.where(range_p > 0, (df_bt['Close'] - df_bt['Low']) / range_p, 0.5)
                 str_3d = df_bt['CloseStr'].rolling(3).mean()
-                w_str = str_3d < 0.5 # A股收紧
+                w_str = str_3d < 0.5 
                 
                 open_high_go_low = (df_bt['Open'] > df_bt['Close'].shift(1)) & (df_bt['Close'] < df_bt['Open'])
                 blew_board = (df_bt['High'] / df_bt['Close'].shift(1) - 1 >= 0.09) & (df_bt['Close'] < df_bt['High'])
@@ -473,13 +472,14 @@ with tab4:
                 weak_relay = (df_bt['ret'] > 0) & (df_bt['ret'] < df_bt['ret'].shift(1)) & (df_bt['CloseStr'] < 0.5) & is_surge
                 break_board = was_consec_limit_up & (~df_bt['limit_up']) & is_surge
                 
-                # 分数合成
                 scores = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0) + ((is_surge & ~fatal_diverge) * 1.0)
                 scores = scores + np.where(weak_relay, 1.0, 0) + np.where(break_board, 2.0, 0)
                 scores = np.where(fatal_diverge, 6.5, scores)
                 scores = np.clip(scores, 0, 6.5)
                 
-                if bt_thresh_val == 6.5: signals = scores >= 6.5
+                # 核心更新：反转过滤逻辑
+                if is_safe_test: signals = scores <= bt_thresh_val
+                elif bt_thresh_val == 6.5: signals = scores >= 6.5
                 else: signals = scores >= bt_thresh_val
                     
                 signal_dates = df_bt.index[signals]
@@ -498,8 +498,16 @@ with tab4:
                         
         if bt_results:
             bt_df = pd.DataFrame(bt_results)
-            success_avoid = len(bt_df[bt_df[f'{bt_period}周期后表现'] < 0]) 
-            st.metric(f"防守胜率 (发出信号后确实下跌避开回调的比例)", f"{(success_avoid / len(bt_df)):.2%}", f"全量历史共发现 {len(bt_df)} 次有效信号")
+            
+            # 核心更新：反转胜率统计口径
+            if is_safe_test:
+                success_count = len(bt_df[bt_df[f'{bt_period}周期后表现'] > 0])
+                metric_label = f"做多胜率 (发出低风险信号后确实上涨的比例)"
+            else:
+                success_count = len(bt_df[bt_df[f'{bt_period}周期后表现'] < 0]) 
+                metric_label = f"防守胜率 (发出高危信号后确实下跌避开回调的比例)"
+                
+            st.metric(metric_label, f"{(success_count / len(bt_df)):.2%}", f"全量历史共发现 {len(bt_df)} 次有效信号")
             st.dataframe(bt_df.style.format({f'{bt_period}周期后表现': '{:.2%}'}).background_gradient(subset=[f'{bt_period}周期后表现'], cmap='RdYlGn_r'), use_container_width=True)
         else:
             st.info(f"在您选择的阈值 [{bt_score_threshold}] 下，未捕捉到任何历史信号。")
