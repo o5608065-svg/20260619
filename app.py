@@ -79,9 +79,9 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.5", layout="wide")
-st.title("📈 强势股自适应逃顶择时系统 v3.5")
-st.caption("🚀 引擎升级：采用真实【换手率】作为拥挤度基准，支持多阈值分数历史向量化回测。")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.6", layout="wide")
+st.title("📈 强势股自适应逃顶择时系统 v3.6")
+st.caption("🚀 引擎升级：采用真实【换手率】作为拥挤度基准，支持多阈值分数历史向量化回测，支持【多代码一键批量导入】。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -101,15 +101,33 @@ benchmark = bm_map[benchmark_ticker]
 
 st.sidebar.markdown("---")
 st.sidebar.header("📁 自选池管理")
-new_stock_input = st.sidebar.text_input("➕ 添加自选 (代码或中文简称):", placeholder="如: AAPL, 茅台, 英伟达")
+
+# ================= 核心修改：批量导入自选 =================
+new_stock_input = st.sidebar.text_input("➕ 批量添加自选 (用逗号隔开):", placeholder="如: AAPL, 茅台, TSLA, 微软")
 if st.sidebar.button("添加", use_container_width=True):
     if new_stock_input:
-        raw_input = new_stock_input.strip()
-        mapped_ticker = STOCK_MAPPING.get(raw_input, raw_input.upper())
-        if mapped_ticker not in st.session_state.watchlist:
-            st.session_state.watchlist.append(mapped_ticker)
+        # 将中文逗号替换为英文逗号，并按逗号分割
+        normalized_input = new_stock_input.replace("，", ",")
+        raw_tickers = normalized_input.split(",")
+        
+        added_any = False
+        for raw_input in raw_tickers:
+            clean_input = raw_input.strip()
+            if not clean_input: continue # 过滤掉连续逗号产生的空字符串
+            
+            # 使用映射系统，或直接转大写
+            mapped_ticker = STOCK_MAPPING.get(clean_input, clean_input.upper())
+            
+            # 只有当列表中不存在时才添加
+            if mapped_ticker not in st.session_state.watchlist:
+                st.session_state.watchlist.append(mapped_ticker)
+                added_any = True
+                
+        # 只要添加了至少一个新标的，就保存并刷新
+        if added_any:
             robust_save_json(WATCHLIST_FILE, st.session_state.watchlist)
             st.rerun()
+# =========================================================
 
 to_remove = st.sidebar.multiselect("➖ 移除自选:", st.session_state.watchlist, format_func=lambda x: f"{x} ({get_stock_name(x)})")
 if st.sidebar.button("确认移除", use_container_width=True) and to_remove:
@@ -142,7 +160,6 @@ def fetch_single_ticker(ticker, start, end, inv):
     if df.empty or len(df) < param_window * 3: return ticker, pd.DataFrame()
     df = df[df['High'] != df['Low']]
     
-    # 核心升级：尝试提取总股本，计算真实换手率
     try:
         t_obj = yf.Ticker(ticker, session=global_session)
         shares = t_obj.info.get('sharesOutstanding', None)
@@ -255,7 +272,6 @@ def run_phase_2(data_dict, phase1_df, window):
         acc_threshold = df['acc'].rolling(history_window).quantile(0.90).iloc[-1]
         w_acc = df['acc'].iloc[-1] > (acc_threshold if pd.notna(acc_threshold) else 0.05)
         
-        # 统一使用 Crowd_Proxy (可能是换手率，也可能是降级的成交额) 计算拥挤度
         vol_pct = df['Crowd_Proxy'].rolling(history_window).apply(
             lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
         w_crowd = vol_pct > param_crowd_pct
@@ -399,7 +415,6 @@ with tab4:
                 df_bt = raw_dfs[ticker].copy()
                 history_window = param_window * 5
                 
-                # 向量化还原历史每一天的得分
                 df_bt['5d_ret'] = df_bt['Close'].pct_change(5)
                 df_bt['acc'] = df_bt['5d_ret'] - df_bt['5d_ret'].rolling(param_window).mean()
                 acc_threshold = df_bt['acc'].rolling(history_window).quantile(0.90)
@@ -421,29 +436,26 @@ with tab4:
                 is_surge = df_bt['Crowd_Proxy'] > (3 * proxy_mean)
                 fatal_diverge = is_surge & ((str_3d < 0.3) | (df_bt['ret'] < -0.02))
                 
-                # 计算总分 (严格对应 Phase 2)
                 scores = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0) + ((is_surge & ~fatal_diverge) * 1.0)
                 scores = np.where(fatal_diverge, 6.5, scores)
                 scores = np.clip(scores, 0, 6.5)
                 
-                # 过滤出符合回测阈值的信号日期
                 if bt_thresh_val == 6.5: signals = scores >= 6.5
                 else: signals = scores >= bt_thresh_val
                     
                 signal_dates = df_bt.index[signals]
                 
-                # 提取表现并加入冷却期机制
                 last_idx = -999
                 for date in signal_dates:
                     idx = df_bt.index.get_loc(date)
-                    if idx - last_idx < bt_period: continue # 冷却期机制，避免重复计算
+                    if idx - last_idx < bt_period: continue 
                     
                     if idx + bt_period < len(df_bt): 
                         price_at_signal = df_bt['Close'].iloc[idx]
                         price_after = df_bt['Close'].iloc[idx + bt_period]
                         ret_period = (price_after / price_at_signal) - 1
                         bt_results.append({'代码': ticker, '名称': get_stock_name(ticker), '信号日期': date.strftime("%Y-%m-%d"), '触发得分': f"{scores[idx]:.1f}", f'{bt_period}周期后表现': ret_period})
-                        last_idx = idx # 更新最后一次触发的位置
+                        last_idx = idx 
                         
         if bt_results:
             bt_df = pd.DataFrame(bt_results)
