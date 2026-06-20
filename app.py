@@ -5,293 +5,313 @@ import yfinance as yf
 import datetime
 import json
 import os
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-# ================= 股票名称与代码映射字典 =================
-STOCK_MAPPING = {
-    "苹果": "AAPL", "APPLE": "AAPL",
-    "英伟达": "NVDA", "NVIDIA": "NVDA",
-    "微软": "MSFT", "MICROSOFT": "MSFT",
-    "特斯拉": "TSLA", "TESLA": "TSLA",
-    "亚马逊": "AMZN", "AMAZON": "AMZN",
-    "谷歌": "GOOGL", "GOOGLE": "GOOGL",
-    "脸书": "META", "META": "META",
-    "超微半导体": "AMD",
-    "贵州茅台": "600519.SS", "茅台": "600519.SS",
-    "宁德时代": "300750.SZ", "宁王": "300750.SZ",
-    "比亚迪": "002594.SZ",
-    "招商银行": "600036.SS", "招行": "600036.SS",
-    "五粮液": "000858.SZ",
-    "中国平安": "601318.SS",
-    "立讯精密": "002475.SZ",
-    "中芯国际": "688981.SS",
-    "中兴通讯": "000063.SZ",
-    "腾讯": "0700.HK", "腾讯控股": "0700.HK",
-    "阿里": "BABA", "阿里巴巴": "BABA"
-}
-
-TICKER_TO_NAME = {v: k for k, v in STOCK_MAPPING.items()}
-
-def resolve_input(raw_inputs):
-    resolved_tickers = []
-    for item in raw_inputs:
-        clean_item = item.strip().upper()
-        if clean_item in [k.upper() for k in STOCK_MAPPING.keys()]:
-            for key, val in STOCK_MAPPING.items():
-                if key.upper() == clean_item:
-                    resolved_tickers.append(val)
-                    break
-        else:
-            resolved_tickers.append(clean_item)
-    return list(dict.fromkeys(resolved_tickers))
-
-# ================= 记忆模块 (自选股与自定义名称持久化) =================
+# ================= 1. 强健的工程模块：JSON备份与重试装饰器 =================
 WATCHLIST_FILE = "watchlist.json"
 CUSTOM_NAMES_FILE = "custom_names.json"
-DEFAULT_WATCHLIST = ["英伟达", "苹果", "微软", "特斯拉", "贵州茅台", "宁王", "AMD", "GOOGL"]
+DEFAULT_WATCHLIST = ["NVDA", "AAPL", "600519.SS", "002594.SZ", "TSLA", "AMD", "0700.HK", "SPY"]
 
-def load_json(file_path, default_val):
+def robust_load_json(file_path, default_val):
     if os.path.exists(file_path):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
-            return default_val
+        except Exception:
+            # 文件损坏，尝试读取备份
+            bak_path = file_path + ".bak"
+            if os.path.exists(bak_path):
+                try:
+                    with open(bak_path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                except: pass
     return default_val
 
-def save_json(file_path, data):
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False)
+def robust_save_json(file_path, data):
+    tmp_path = file_path + ".tmp"
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+        if os.path.exists(file_path):
+            shutil.copy(file_path, file_path + ".bak") # 备份老文件
+        os.replace(tmp_path, file_path) # 原子替换
+    except Exception as e:
+        st.sidebar.error(f"本地存储异常: {e}")
 
-# 初始化 Session State
-if 'watchlist' not in st.session_state:
-    st.session_state.watchlist = load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
-if 'custom_names' not in st.session_state:
-    st.session_state.custom_names = load_json(CUSTOM_NAMES_FILE, {})
+# 重试装饰器
+def retry_on_exception(retries=3, delay=1):
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            for i in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if i == retries - 1:
+                        return pd.DataFrame()
+                    time.append(delay)
+            return pd.DataFrame()
+        return wrapper
+    return decorator
 
-def get_stock_name(ticker):
-    """获取股票名称，优先使用用户自定义名称，其次是系统默认映射"""
-    return st.session_state.custom_names.get(ticker, TICKER_TO_NAME.get(ticker, ticker))
+# 初始化 Session
+if 'watchlist' not in st.session_state: st.session_state.watchlist = robust_load_json(WATCHLIST_FILE, DEFAULT_WATCHLIST)
+if 'custom_names' not in st.session_state: st.session_state.custom_names = robust_load_json(CUSTOM_NAMES_FILE, {})
 
-# ================= 页面与基础配置 =================
-st.set_page_config(page_title="强势股逃顶择时系统", layout="wide")
-st.title("📈 强势股逃顶择时量化系统")
-st.markdown("基于风险调整后动量选股与拥挤度监控的实战框架")
+def get_stock_name(ticker): return st.session_state.custom_names.get(ticker, ticker)
 
-# ================= 侧边栏：自选股记忆模块 =================
-st.sidebar.header("📁 自选股记忆模块")
+# ================= 2. 页面与侧边栏动态参数 =================
+st.set_page_config(page_title="全天候量化逃顶系统 v2.0", layout="wide")
+st.title("📈 强势股逃顶择时与共振网络系统 v2.0")
 
-# 1. 添加自选股
-new_stock = st.sidebar.text_input("➕ 添加自选 (支持中文名或代码):", placeholder="例如: 腾讯 或 002594.SZ")
-if st.sidebar.button("添加", use_container_width=True):
-    if new_stock:
-        clean_new = new_stock.strip()
-        if clean_new not in st.session_state.watchlist:
-            st.session_state.watchlist.append(clean_new)
-            save_json(WATCHLIST_FILE, st.session_state.watchlist)
-            st.sidebar.success(f"已成功添加: {clean_new}")
-            st.rerun() 
-        else:
-            st.sidebar.warning("该股票已在自选池中！")
+st.sidebar.header("⚙️ 动态参数与引擎设置")
+
+# 时间周期设置
+interval_option = st.sidebar.selectbox("K线级别", ["1d (日线)", "60m (小时线)", "30m (半小时)"])
+interval_map = {"1d (日线)": "1d", "60m (小时线)": "60m", "30m (半小时)": "30m"}
+interval = interval_map[interval_option]
+
+lookback_days = st.sidebar.slider("拉取回溯天数 (美股分钟级限730天)", 100, 730, 400)
+
+# 动态阈值设置
+st.sidebar.subheader("指标阈值调优")
+param_window = st.sidebar.number_input("动量/波动计算周期", 10, 60, 20)
+param_crowd_pct = st.sidebar.slider("极端拥挤度分位数阈值", 0.80, 0.99, 0.90)
+param_vol_ratio = st.sidebar.slider("短期波动异常放大倍数", 1.2, 3.0, 1.5)
+
+benchmark_ticker = st.sidebar.selectbox("选择对标大盘基准", ["SPY (标普500)", "000300.SS (沪深300)", "^HSI (恒生指数)"])
+bm_map = {"SPY (标普500)": "SPY", "000300.SS (沪深300)": "000300.SS", "^HSI (恒生指数)": "^HSI"}
+benchmark = bm_map[benchmark_ticker]
 
 st.sidebar.markdown("---")
-
-# 2. 移除自选股
-to_remove = st.sidebar.multiselect("➖ 移除自选 (可多选):", st.session_state.watchlist)
-if st.sidebar.button("确认移除", use_container_width=True):
-    if to_remove:
-        st.session_state.watchlist = [s for s in st.session_state.watchlist if s not in to_remove]
-        save_json(WATCHLIST_FILE, st.session_state.watchlist)
-        st.sidebar.success("移除成功！")
+st.sidebar.header("📁 自选池管理")
+new_stock = st.sidebar.text_input("➕ 添加自选 (标准代码):", placeholder="例如: AAPL, 600519.SS")
+if st.sidebar.button("添加", use_container_width=True):
+    if new_stock and new_stock not in st.session_state.watchlist:
+        st.session_state.watchlist.append(new_stock.strip().upper())
+        robust_save_json(WATCHLIST_FILE, st.session_state.watchlist)
         st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.markdown(f"**当前监控池 (共 {len(st.session_state.watchlist)} 只):**")
-st.sidebar.info(", ".join(st.session_state.watchlist))
+to_remove = st.sidebar.multiselect("➖ 移除自选:", st.session_state.watchlist)
+if st.sidebar.button("确认移除", use_container_width=True) and to_remove:
+    st.session_state.watchlist = [s for s in st.session_state.watchlist if s not in to_remove]
+    robust_save_json(WATCHLIST_FILE, st.session_state.watchlist)
+    st.rerun()
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("主观盘面判断")
-is_sector_collapsing = st.sidebar.checkbox(
-    "🚨 触发清仓级信号 (板块崩塌)", 
-    help="观察到板块资金扩散：最强的龙头股高位滞涨，而边缘垃圾股突然补涨（群魔乱舞）。"
-)
+tickers = list(dict.fromkeys(st.session_state.watchlist + [benchmark]))
 
-tickers = resolve_input(st.session_state.watchlist)
+# ================= 3. 异步数据拉取与清洗引擎 =================
+@retry_on_exception(retries=3)
+def fetch_single_ticker(ticker, start, end, inv):
+    df = yf.download(ticker, start=start, end=end, interval=inv, progress=False)
+    if df.empty or len(df) < param_window + 5: return ticker, pd.DataFrame()
+    
+    # 扁平化多层索引 (yfinance最新版本特性)
+    if isinstance(df.columns, pd.MultiIndex):
+        df = pd.DataFrame({'Open': df['Open'][ticker], 'High': df['High'][ticker], 'Low': df['Low'][ticker], 'Close': df['Close'][ticker], 'Volume': df['Volume'][ticker]})
+    else:
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        
+    # 核心清洗：剔除全天停牌或一字涨跌停的数据（最高价==最低价），避免波动率和成交量失真
+    df = df[df['High'] != df['Low']]
+    return ticker, df
 
-# ================= 核心数据获取 (带缓存) =================
-@st.cache_data(ttl=3600)
-def fetch_market_data(tickers_list, days=400):
-    end_date = datetime.date.today()
+@st.cache_data(ttl=900) # 15分钟缓存
+def fetch_all_data(tickers_list, days, inv):
+    end_date = datetime.date.today() + datetime.timedelta(days=1)
     start_date = end_date - datetime.timedelta(days=days)
     data_dict = {}
     
-    with st.spinner('正在联网拉取核心行情数据...'):
-        for ticker in tickers_list:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if not df.empty and len(df) > 260:
-                if isinstance(df.columns, pd.MultiIndex):
-                    clean_df = pd.DataFrame({
-                        'Close': df['Close'][ticker], 'High': df['High'][ticker],
-                        'Low': df['Low'][ticker], 'Volume': df['Volume'][ticker]
-                    })
-                else:
-                    clean_df = df[['Close', 'High', 'Low', 'Volume']].copy()
-                data_dict[ticker] = clean_df
+    with st.spinner('🚀 正在启用线程池异步并发拉取行情...'):
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(fetch_single_ticker, t, start_date, end_date, inv) for t in tickers_list]
+            for future in as_completed(futures):
+                ticker, df = future.result()
+                if not df.empty: data_dict[ticker] = df
     return data_dict
 
-data_dict = fetch_market_data(tickers)
-
+data_dict = fetch_all_data(tickers, lookback_days, interval)
 if not data_dict:
-    st.error("无法获取数据。请检查自选池中是否有拼写错误，或者检查网络连接。")
+    st.error("无法获取数据，请检查网络或回溯天数。")
     st.stop()
 
-# ================= 逻辑模块 =================
-def run_phase_1(data_dict, window=20):
+# ================= 4. 核心计算模块 =================
+# 全局变量，用于存储基准收益率序列
+bm_returns = data_dict[benchmark]['Close'].pct_change() if benchmark in data_dict else None
+
+def run_phase_1(data_dict, window):
     results = []
     for ticker, df in data_dict.items():
-        temp_df = df[['Close']].copy()
-        temp_df['MOM20'] = temp_df['Close'] / temp_df['Close'].shift(window) - 1
-        temp_df['daily_return'] = temp_df['Close'].pct_change()
-        temp_df['volatility_20d'] = temp_df['daily_return'].rolling(window=window).std()
-        temp_df['RAM'] = np.where(temp_df['volatility_20d'] > 0, temp_df['MOM20'] / temp_df['volatility_20d'], np.nan)
+        if ticker == benchmark: continue
+        df = df.copy()
+        df['MOM'] = df['Close'] / df['Close'].shift(window) - 1
+        df['daily_ret'] = df['Close'].pct_change()
+        df['vol'] = df['daily_ret'].rolling(window=window).std()
+        df['RAM'] = np.where(df['vol'] > 0, df['MOM'] / df['vol'], np.nan)
         
-        latest = temp_df.iloc[-1]
+        # 对标基准相对强度 (RS) = 个股动量 - 大盘动量
+        rs_score = "N/A"
+        if bm_returns is not None:
+            bm_mom = bm_returns.rolling(window).sum().iloc[-1]
+            rs_score = df['MOM'].iloc[-1] - bm_mom
+            
+        latest = df.iloc[-1]
         results.append({
-            '股票代码': ticker, '股票名称': get_stock_name(ticker), '最新收盘价': latest['Close'],
-            '20日动量': latest['MOM20'], '20日波动率': latest['volatility_20d'], '风险调整后动量 (RAM)': latest['RAM']
+            '代码': ticker, '名称': get_stock_name(ticker), '收盘价': latest['Close'],
+            f'{window}日动量': latest['MOM'], f'{window}日波动': latest['vol'],
+            '超额强度(RS)': rs_score, '风险调整动量(RAM)': latest['RAM']
         })
-    df_res = pd.DataFrame(results).dropna()
-    return df_res.sort_values(by='风险调整后动量 (RAM)', ascending=False).reset_index(drop=True)
+    return pd.DataFrame(results).sort_values(by='风险调整动量(RAM)', ascending=False).reset_index(drop=True)
 
-def run_phase_2(data_dict, selected_tickers):
-    results = []
+def run_phase_2(data_dict, selected_tickers, window):
+    results, raw_signals = [], {}
     for ticker in selected_tickers:
         if ticker not in data_dict: continue
         df = data_dict[ticker].copy()
-        df['daily_return'] = df['Close'].pct_change()
-        df['5d_return'] = df['Close'].pct_change(5)
+        df['ret'] = df['Close'].pct_change()
+        df['5d_ret'] = df['Close'].pct_change(5)
         
-        df['5d_return_20d_avg'] = df['5d_return'].rolling(window=20).mean()
-        acc = (df['5d_return'] - df['5d_return_20d_avg']).iloc[-1]
-        warn_acc = acc > 0.05 
+        # 指标1: 加速
+        acc = (df['5d_ret'] - df['5d_ret'].rolling(window).mean()).iloc[-1]
+        w_acc = acc > 0.05 
         
-        vol_pct = df['Volume'].rolling(252).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
-        warn_crowd = vol_pct > 0.90
+        # 指标2: 拥挤度 (区分量化/散户特征)
+        vol_pct = df['Volume'].rolling(window*5).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
+        w_crowd = vol_pct > param_crowd_pct
         
-        vol_ratio = (df['daily_return'].rolling(5).std().iloc[-1]) / (df['daily_return'].rolling(20).std().iloc[-1] + 1e-9)
-        warn_vol = vol_ratio > 1.5
+        # 指标3: 波动放大
+        vol_ratio = (df['ret'].rolling(5).std() / (df['ret'].rolling(window).std() + 1e-9)).iloc[-1]
+        w_vol = vol_ratio > param_vol_ratio
         
+        # 指标4: 弱收盘
         range_p = df['High'] - df['Low']
-        df['CloseStrength'] = np.where(range_p > 0, (df['Close'] - df['Low']) / range_p, 0.5)
-        strength_3d = df['CloseStrength'].rolling(3).mean().iloc[-1]
-        warn_strength = strength_3d < 0.5
+        df['CloseStr'] = np.where(range_p > 0, (df['Close'] - df['Low']) / range_p, 0.5)
+        str_3d = df['CloseStr'].rolling(3).mean().iloc[-1]
+        w_str = str_3d < 0.4
         
-        vol_20d_avg = df['Volume'].rolling(20).mean().iloc[-1]
-        warn_diverge = (df['Volume'].iloc[-1] > (2 * vol_20d_avg)) and (df['CloseStrength'].iloc[-1] < 0.5)
+        # 指标5: 量价背离 (致命信号权重为2)
+        is_surge = df['Volume'].iloc[-1] > (2 * df['Volume'].rolling(window).mean().iloc[-1])
+        w_diverge = is_surge and str_3d < 0.5
         
-        score = sum([warn_acc, warn_crowd, warn_vol, warn_strength, warn_diverge])
+        # 散户 vs 量化特征判断 (仅作参考展示)
+        crowd_type = "未极度拥挤"
+        if w_crowd:
+            tail_shadow = (df['High'].iloc[-1] - max(df['Open'].iloc[-1], df['Close'].iloc[-1])) / df['Close'].iloc[-1]
+            if tail_shadow > 0.03: crowd_type = "量化高频洗盘 🤖"
+            elif str_3d > 0.6: crowd_type = "散户追高合力 🙋‍♂️"
+            else: crowd_type = "主力派发 📉"
+
+        # 加权打分
+        score = (w_diverge * 2) + (w_str * 1.5) + (w_acc * 1) + (w_crowd * 1) + (w_vol * 1)
         
+        raw_signals[ticker] = df # 保存计算后DF传给绘图用
         results.append({
-            '股票代码': ticker, '股票名称': get_stock_name(ticker), '加速率 (>0.05)': f"{acc:.3f} {'🔴' if warn_acc else '🟢'}",
-            '拥挤度 (>90%)': f"{vol_pct:.2%} {'🔴' if warn_crowd else '🟢'}", '波动率比 (>1.5)': f"{vol_ratio:.2f} {'🔴' if warn_vol else '🟢'}",
-            '收盘强度 (<0.5)': f"{strength_3d:.2f} {'🔴' if warn_strength else '🟢'}", '量价背离': f"{'是 🔴' if warn_diverge else '否 🟢'}",
-            '风险得分 (0-5)': score
+            '代码': ticker, '名称': get_stock_name(ticker), 
+            '加速率': f"{acc:.3f}", '拥挤特征': crowd_type, '波动比': f"{vol_ratio:.2f}",
+            '背离/破位': "🔴 致命" if w_diverge else "🟢 正常",
+            '加权风险(满分6.5)': score
         })
-    return pd.DataFrame(results)
+    return pd.DataFrame(results), raw_signals
 
-def run_phase_3(risk_df, is_collapsing):
-    orders = []
-    if is_collapsing:
-        for _, row in risk_df.iterrows():
-            orders.append({
-                '股票代码': row['股票代码'], '股票名称': row['股票名称'],
-                '警报级别': '🚨 清仓级', '执行动作': '清仓离场 (板块崩塌)', '目标仓位': '0%'
-            })
-        return pd.DataFrame(orders)
-        
-    for _, row in risk_df.iterrows():
-        score = row['风险得分 (0-5)']
-        if score >= 3:
-            level, action, pos = "🔴 危险级", "立刻减仓锁定利润", "50%"
-        elif score >= 1:
-            level, action, pos = "🟠 警告级", "停止加仓，密切观察", "维持现有仓位"
-        else:
-            level, action, pos = "🟢 安全级", "正常持有", "维持现有仓位"
-            
-        orders.append({
-            '股票代码': row['股票代码'], '股票名称': row['股票名称'], '风险得分': score, 
-            '警报级别': level, '执行动作': action, '目标仓位': pos
-        })
-    return pd.DataFrame(orders)
-
-# ================= UI 渲染与可编辑表格机制 =================
-tab1, tab2, tab3 = st.tabs(["📊 阶段一：选股建仓", "🕵️‍♂️ 阶段二：日常监控", "⚡ 阶段三：行动准则"])
-
-def handle_name_edit(edited_df, original_df):
-    """检测名称修改并保存到本地 JSON"""
-    changed = False
-    for idx, row in edited_df.iterrows():
-        old_name = original_df.at[idx, '股票名称']
-        new_name = row['股票名称']
-        ticker = row['股票代码']
-        if new_name != old_name:
-            st.session_state.custom_names[ticker] = new_name
-            changed = True
-            
-    if changed:
-        save_json(CUSTOM_NAMES_FILE, st.session_state.custom_names)
-        st.rerun()
+# ================= 5. UI 呈现与高级功能 =================
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 阶段一：选股与超额", "🕵️ 阶段二：加权预警", "⚡ 阶段三：执行与崩塌监测", "🕯️ 独立K线复盘", "⏱️ 信号回溯测算"])
 
 with tab1:
-    st.subheader("核心指标：寻找上涨平稳、波动率低的健康标的")
-    st.caption("💡 提示：您可以直接在下方表格双击【股票名称】单元格进行修改，系统将永久记住您的自定义别名。")
-    
-    phase1_df = run_phase_1(data_dict)
-    
-    # 提前格式化数字，以便兼容可编辑表格
-    display_df1 = phase1_df.copy()
-    display_df1['20日动量'] = display_df1['20日动量'].apply(lambda x: f"{x:.2%}")
-    display_df1['20日波动率'] = display_df1['20日波动率'].apply(lambda x: f"{x:.4f}")
-    display_df1['风险调整后动量 (RAM)'] = display_df1['风险调整后动量 (RAM)'].apply(lambda x: f"{x:.4f}")
-    
-    # 将 DataFrame 渲染为可交互编辑的表格
-    edited_df1 = st.data_editor(
-        display_df1,
-        disabled=["股票代码", "最新收盘价", "20日动量", "20日波动率", "风险调整后动量 (RAM)"],
-        use_container_width=True,
-        key="editor_tab1",
-        hide_index=True
-    )
-    handle_name_edit(edited_df1, display_df1)
+    st.subheader("核心指标：寻找平稳高动量、具有大盘超额收益的标的")
+    phase1_df = run_phase_1(data_dict, param_window)
+    st.dataframe(phase1_df.style.format({f'{param_window}日动量': '{:.2%}', f'{param_window}日波动': '{:.4f}', '超额强度(RS)': '{:.4f}', '风险调整动量(RAM)': '{:.4f}'}), use_container_width=True)
 
 with tab2:
-    st.subheader("高危预警系统：5大维度透视资金结构")
-    st.caption("注：红色圆点 🔴 代表该指标触及警戒阈值，绿色 🟢 代表处于健康状态。支持直接双击修改股票名称。")
+    st.subheader(f"多维高危预警与资金属性分析 (周期: {interval})")
+    phase2_df, raw_dfs = run_phase_2(data_dict, phase1_df['代码'].tolist(), param_window)
+    st.dataframe(phase2_df.style.background_gradient(subset=['加权风险(满分6.5)'], cmap='Reds'), use_container_width=True)
     
-    phase2_df = run_phase_2(data_dict, phase1_df['股票代码'].tolist())
-    
-    edited_df2 = st.data_editor(
-        phase2_df,
-        disabled=[col for col in phase2_df.columns if col != '股票名称'],
-        use_container_width=True,
-        key="editor_tab2",
-        hide_index=True
-    )
-    handle_name_edit(edited_df2, phase2_df)
-
 with tab3:
-    st.subheader("仓位管理：基于水温严格执行纪律")
-    if is_sector_collapsing:
-        st.error("【全局警报】检测到板块内部轮动崩塌（龙头滞涨，边缘股补涨）！资金已无法推高龙头。")
+    st.subheader("全局监控与仓位指令")
     
-    phase3_df = run_phase_3(phase2_df, is_sector_collapsing)
+    # 自动感知板块崩塌：如果平均加权风险 > 3.0，判定为板块高危
+    avg_risk = phase2_df['加权风险(满分6.5)'].mean() if not phase2_df.empty else 0
+    auto_collapse = avg_risk > 3.0
     
-    edited_df3 = st.data_editor(
-        phase3_df,
-        disabled=[col for col in phase3_df.columns if col != '股票名称'],
-        use_container_width=True,
-        key="editor_tab3",
-        hide_index=True
-    )
-    handle_name_edit(edited_df3, phase3_df)
+    col1, col2 = st.columns([1, 2])
+    col1.metric("当前股票池平均危险指数", f"{avg_risk:.2f} / 6.5")
+    if auto_collapse:
+        col2.error("🚨 【系统自动判定：触发全局清仓警报】股票池整体热度崩塌，请无差别降仓！")
+    else:
+        col2.success("✅ 【系统状态正常】未监测到大面积资金出逃，依据个股信号操作。")
+
+    orders = []
+    for _, row in phase2_df.iterrows():
+        if auto_collapse:
+            level, action, pos = "🚨 崩塌清仓", "清仓离场", "0%"
+        else:
+            score = row['加权风险(满分6.5)']
+            if score >= 4.0: level, action, pos = "🔴 致命危险", "立刻减仓 80%", "20%"
+            elif score >= 2.5: level, action, pos = "🟠 高度警告", "减仓锁定利润", "50%"
+            elif score >= 1.0: level, action, pos = "🟡 温和预警", "停止加仓，收紧止损", "维持"
+            else: level, action, pos = "🟢 安全趋势", "正常持有", "维持满仓"
+        orders.append({'代码': row['代码'], '名称': row['名称'], '加权风险': row['加权风险(满分6.5)'], '级别': level, '动作': action, '目标仓位': pos})
+    st.dataframe(pd.DataFrame(orders), use_container_width=True)
+
+with tab4:
+    st.subheader("Plotly 交互式量价视界与预警标记")
+    st.caption("直观验证：高位滞涨、天量上影线、缩量阴跌等形态。")
+    plot_ticker = st.selectbox("选择要复盘的标的", phase2_df['代码'].tolist() if not phase2_df.empty else [])
     
-    st.info("量化逃顶核心哲学：不要预测明天是涨是跌，而是测量当下的“水温”。")
+    if plot_ticker and plot_ticker in raw_dfs:
+        plot_df = raw_dfs[plot_ticker].tail(100) # 取最近100根K线
+        
+        # 计算历史每个节点的量价背离点用于标注
+        vol_ma = plot_df['Volume'].rolling(param_window).mean()
+        surge_points = (plot_df['Volume'] > 2 * vol_ma) & (plot_df['CloseStr'] < 0.5)
+        
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.7, 0.3])
+        
+        # 绘制 K 线
+        fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], name='K线'), row=1, col=1)
+        # 绘制均线
+        fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['Close'].rolling(param_window).mean(), line=dict(color='orange', width=1), name=f'MA{param_window}'), row=1, col=1)
+        
+        # 标记爆量滞涨高危点 (红点标记在最高价上方)
+        danger_x = plot_df.index[surge_points]
+        danger_y = plot_df['High'][surge_points] * 1.02 # 高于均价2%处画点
+        fig.add_trace(go.Scatter(x=danger_x, y=danger_y, mode='markers', marker=dict(color='red', size=10, symbol='circle'), name='致命背离预警'), row=1, col=1)
+
+        # 绘制成交量
+        colors = ['red' if close < open_p else 'green' for close, open_p in zip(plot_df['Close'], plot_df['Open'])]
+        fig.add_trace(go.Bar(x=plot_df.index, y=plot_df['Volume'], marker_color=colors, name='成交量'), row=2, col=1)
+        
+        fig.update_layout(height=600, xaxis_rangeslider_visible=False, title=f"{get_stock_name(plot_ticker)} ({plot_ticker}) 量价结构分析", template='plotly_dark')
+        st.plotly_chart(fig, use_container_width=True)
+
+with tab5:
+    st.subheader("简易胜率回溯测算 (历史红灯预警的后续表现)")
+    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **致命背离预警** 后 5 个周期的涨跌情况。")
+    if st.button("▶️ 开始回溯计算"):
+        bt_results = []
+        for ticker in phase1_df['代码'].tolist():
+            if ticker not in raw_dfs: continue
+            df_bt = raw_dfs[ticker].copy()
+            vol_ma_bt = df_bt['Volume'].rolling(param_window).mean()
+            # 找到所有的触发点
+            signals = (df_bt['Volume'] > 2 * vol_ma_bt) & (df_bt['CloseStr'] < 0.5)
+            signal_dates = df_bt.index[signals]
+            
+            for date in signal_dates:
+                idx = df_bt.index.get_loc(date)
+                if idx + 5 < len(df_bt): # 确保后面有5天的数据
+                    price_at_signal = df_bt['Close'].iloc[idx]
+                    price_after_5 = df_bt['Close'].iloc[idx + 5]
+                    ret_5d = (price_after_5 / price_at_signal) - 1
+                    bt_results.append({'代码': ticker, '信号日期': date.strftime("%Y-%m-%d"), '5周期后跌幅(避险成功率)': ret_5d})
+                    
+        if bt_results:
+            bt_df = pd.DataFrame(bt_results)
+            success_avoid = len(bt_df[bt_df['5周期后跌幅(避险成功率)'] < 0]) # 信号出现后真的跌了，说明避险成功
+            st.metric("红点预警防守胜率 (发出信号后后续5周期确实下跌的比例)", f"{(success_avoid / len(bt_df)):.2%}", f"共触发 {len(bt_df)} 次历史信号")
+            st.dataframe(bt_df.style.format({'5周期后跌幅(避险成功率)': '{:.2%}'}), use_container_width=True)
+        else:
+            st.info("在所选周期内，未找到触发极端背离预警的历史数据。")
