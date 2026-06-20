@@ -79,9 +79,9 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.10", layout="wide")
-st.title("📈 强势股情绪逃顶系统 v3.10")
-st.caption("🚀 终极回测版：支持 1 日（次日）溢价/核按钮测试，精确检验超短线接力胜率。")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.11", layout="wide")
+st.title("📈 强势股情绪逃顶系统 v3.11")
+st.caption("🚀 终极透视版：二阶段面板新增【同分历史表现】，底层运算架构大重构，回测引擎提升至0延迟。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
@@ -187,7 +187,7 @@ if not data_dict:
 bm_returns = data_dict[benchmark]['Close'].pct_change() if benchmark in data_dict else None
 latest_market_date = max([df.index[-1] for df in data_dict.values() if not df.empty]) if data_dict else pd.Timestamp.now()
 
-# ================= 4. 核心计算模块 =================
+# ================= 4. 核心计算模块 (向量化大重构) =================
 def run_phase_1(data_dict, window):
     results = []
     min_data_required = window * 5 
@@ -247,78 +247,117 @@ def run_phase_2(data_dict, phase1_df, window):
             results.append({
                 '代码': ticker, '名称': get_stock_name(ticker), 
                 '加速异动': "-", '拥挤指标基准': "-", '客观形态特征': status, '自适应波动比': "-",
-                '背离/破位': "-", '综合高危得分(满分6.5)': 0, '_sort_val': -1
+                '背离/破位': "-", '综合高危得分(满分6.5)': 0, 
+                '同分1日预期': "-", '同分3日预期': "-", '同分5日预期': "-", '同分10日预期': "-",
+                '_sort_val': -1
             })
             continue
 
         df = data_dict[ticker].copy()
         proxy_type = df['Proxy_Type'].iloc[-1]
         
+        # 核心：全盘向量化历史推演，取代过去只计算最后一天的单薄逻辑
         df['ret'] = df['Close'].pct_change()
         df['5d_ret'] = df['Close'].pct_change(5)
         
         df['limit_up'] = df['ret'] >= 0.09
-        df['streak'] = np.where(df['limit_up'], df['limit_up'].groupby((~df['limit_up']).cumsum()).cumcount() + 1, 0)
+        df['streak'] = df['limit_up'].groupby((~df['limit_up']).cumsum()).cumcount()
+        df['streak'] = np.where(df['limit_up'], df['streak'] + 1, 0)
         
-        was_consecutive_limit_up = df['streak'].iloc[-2] >= 2 if len(df) > 1 else False
-        was_limit_up = df['streak'].iloc[-2] >= 1 if len(df) > 1 else False
+        was_limit_up = df['streak'].shift(1) >= 1
+        was_consec_limit_up = df['streak'].shift(1) >= 2
         
-        dynamic_surge_mul = 2.0 if was_limit_up else 3.0
-        proxy_mean = df['Crowd_Proxy'].rolling(window).mean().iloc[-1]
-        is_surge = df['Crowd_Proxy'].iloc[-1] > (dynamic_surge_mul * proxy_mean)
+        dynamic_surge_mul = np.where(was_limit_up, 2.0, 3.0)
+        proxy_mean = df['Crowd_Proxy'].rolling(window).mean()
+        is_surge = df['Crowd_Proxy'] > (dynamic_surge_mul * proxy_mean)
 
         df['acc'] = df['5d_ret'] - df['5d_ret'].rolling(window).mean()
-        acc_threshold = df['acc'].rolling(history_window).quantile(0.90).iloc[-1]
-        w_acc = df['acc'].iloc[-1] > (acc_threshold if pd.notna(acc_threshold) else 0.05)
+        acc_threshold = df['acc'].rolling(history_window).quantile(0.90)
+        w_acc = df['acc'] > acc_threshold.fillna(0.05)
         
-        dynamic_crowd_pct = 0.75 if (was_consecutive_limit_up or df['streak'].iloc[-1] >= 2) else param_crowd_pct
-        vol_pct = df['Crowd_Proxy'].rolling(history_window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
+        dynamic_crowd_pct = np.where((was_consec_limit_up) | (df['streak'] >= 2), 0.75, param_crowd_pct)
+        vol_pct = df['Crowd_Proxy'].rolling(history_window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan)
         w_crowd = vol_pct > dynamic_crowd_pct
         
         df['vol_ratio'] = df['ret'].rolling(5).std() / (df['ret'].rolling(window).std() + 1e-9)
-        vol_ratio_threshold = df['vol_ratio'].rolling(history_window).quantile(0.90).iloc[-1]
-        w_vol = df['vol_ratio'].iloc[-1] > (vol_ratio_threshold if pd.notna(vol_ratio_threshold) else 1.5)
+        vol_ratio_threshold = df['vol_ratio'].rolling(history_window).quantile(0.90)
+        w_vol = df['vol_ratio'] > vol_ratio_threshold.fillna(1.5)
         
         range_p = df['High'] - df['Low']
         df['CloseStr'] = np.where(range_p > 0, (df['Close'] - df['Low']) / range_p, 0.5)
-        str_3d = df['CloseStr'].rolling(3).mean().iloc[-1]
+        str_3d = df['CloseStr'].rolling(3).mean()
         w_str = str_3d < 0.5 
         
-        open_high_go_low = (df['Open'].iloc[-1] > df['Close'].iloc[-2]) and (df['Close'].iloc[-1] < df['Open'].iloc[-1])
-        blew_board = (df['High'].iloc[-1] / df['Close'].iloc[-2] - 1 >= 0.09) and (df['Close'].iloc[-1] < df['High'].iloc[-1])
-        early_fatal = was_limit_up and (open_high_go_low or blew_board) and is_surge
+        open_high_go_low = (df['Open'] > df['Close'].shift(1)) & (df['Close'] < df['Open'])
+        blew_board = (df['High'] / df['Close'].shift(1) - 1 >= 0.09) & (df['Close'] < df['High'])
+        early_fatal = was_limit_up & (open_high_go_low | blew_board) & is_surge
         
-        fatal_diverge = (is_surge and ((str_3d < 0.3) or (df['ret'].iloc[-1] < -0.02))) or early_fatal
+        fatal_diverge = (is_surge & ((str_3d < 0.3) | (df['ret'] < -0.02))) | early_fatal
         
-        weak_relay = (df['ret'].iloc[-1] > 0) and (df['ret'].iloc[-1] < df['ret'].iloc[-2]) and (df['CloseStr'].iloc[-1] < 0.5) and is_surge
-        break_board = was_consecutive_limit_up and not df['limit_up'].iloc[-1] and is_surge
+        weak_relay = (df['ret'] > 0) & (df['ret'] < df['ret'].shift(1)) & (df['CloseStr'] < 0.5) & is_surge
+        break_board = was_consec_limit_up & (~df['limit_up']) & is_surge
         
+        scores = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0) + ((is_surge & ~fatal_diverge) * 1.0)
+        scores = scores + np.where(weak_relay, 1.0, 0) + np.where(break_board, 2.0, 0)
+        scores = np.where(fatal_diverge, 6.5, scores)
+        scores = np.clip(scores, 0, 6.5)
+        
+        df['Score'] = scores # 把每天的历史得分牢牢锁定在 DataFrame 里
+        
+        # 提取今天的最终信号
+        curr_score = df['Score'].iloc[-1]
+        curr_fatal = fatal_diverge.iloc[-1]
+        curr_early_fatal = early_fatal.iloc[-1]
+        curr_break_board = break_board.iloc[-1]
+        curr_weak_relay = weak_relay.iloc[-1]
+        curr_w_crowd = w_crowd.iloc[-1]
+        curr_str_3d = str_3d.iloc[-1]
+
         pattern_desc = "正常波动"
-        if fatal_diverge: pattern_desc = "🛑 史诗级断头/炸板"
-        elif break_board: pattern_desc = "💔 连板断板退潮"
-        elif early_fatal: pattern_desc = "⚠️ 高位炸板放量"
-        elif weak_relay: pattern_desc = "📉 情绪放量弱承接"
-        elif w_crowd:
+        if curr_fatal: pattern_desc = "🛑 史诗级断头/炸板"
+        elif curr_break_board: pattern_desc = "💔 连板断板退潮"
+        elif curr_early_fatal: pattern_desc = "⚠️ 高位炸板放量"
+        elif curr_weak_relay: pattern_desc = "📉 情绪放量弱承接"
+        elif curr_w_crowd:
             tail_shadow = (df['High'].iloc[-1] - max(df['Open'].iloc[-1], df['Close'].iloc[-1])) / df['Close'].iloc[-1]
             if tail_shadow > 0.03: pattern_desc = "高位长影拒斥 📉"
-            elif str_3d > 0.6: pattern_desc = "趋势放量冲刺 🚀"
+            elif curr_str_3d > 0.6: pattern_desc = "趋势放量冲刺 🚀"
             else: pattern_desc = "极端拥挤滞涨 ⚠️"
 
-        if fatal_diverge: score = 6.5 
-        else:
-            score = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0)
-            if is_surge and not fatal_diverge: score += 1.0 
-            if weak_relay: score += 1.0  
-            if break_board: score += 2.0 
+        # 核心：精准捕捉历史上和今天一样得分的日子，测算未来的真实平均涨跌幅
+        match_indices = np.where(df['Score'] == curr_score)[0]
+        
+        def get_avg_ret(n_days):
+            rets = []
+            for idx in match_indices:
+                if idx < len(df) - n_days: # 排除掉最近几天（因为未来还没发生）
+                    p0 = df['Close'].iloc[idx]
+                    pn = df['Close'].iloc[idx + n_days]
+                    rets.append((pn / p0) - 1)
+            return np.mean(rets) if rets else np.nan
+
+        avg_1d = get_avg_ret(1)
+        avg_3d = get_avg_ret(3)
+        avg_5d = get_avg_ret(5)
+        avg_10d = get_avg_ret(10)
+
+        def format_ret(val):
+            if pd.isna(val): return "样本不足"
+            return f"{val:+.2%}"
             
-        raw_signals[ticker] = df 
+        raw_signals[ticker] = df # 将带完整 Score 序列的 df 传递给 Tab 4
         results.append({
             '代码': ticker, '名称': get_stock_name(ticker), 
-            '加速异动': "是" if w_acc else "否", 
+            '加速异动': "是" if w_acc.iloc[-1] else "否", 
             '拥挤指标基准': f"✅{proxy_type}" if proxy_type == '换手率' else f"⚠️{proxy_type}",
             '客观形态特征': pattern_desc, '自适应波动比': f"{df['vol_ratio'].iloc[-1]:.2f}",
-            '背离/破位': "🔴 致命熔断" if fatal_diverge else "🟢 正常",
-            '综合高危得分(满分6.5)': min(score, 6.5), '_sort_val': score
+            '背离/破位': "🔴 致命熔断" if curr_fatal else "🟢 正常",
+            '综合高危得分(满分6.5)': curr_score,
+            '同分1日预期': format_ret(avg_1d),
+            '同分3日预期': format_ret(avg_3d),
+            '同分5日预期': format_ret(avg_5d),
+            '同分10日预期': format_ret(avg_10d),
+            '_sort_val': curr_score
         })
         
     df_res = pd.DataFrame(results).sort_values(by='_sort_val', ascending=False).drop(columns=['_sort_val']).reset_index(drop=True)
@@ -329,8 +368,23 @@ def highlight_suspended(row):
         return ['color: #888888; background-color: #2b2b2b'] * len(row)
     return [''] * len(row)
 
+# 专属给同分预期列上色（A股红涨绿跌习惯）
+def color_returns_col(col):
+    colors = []
+    for val in col:
+        if '样本不足' in str(val) or val == "-":
+            colors.append('color: #888888')
+        else:
+            try:
+                numeric_val = float(str(val).replace('%', '').replace('+', ''))
+                c = '#ff4b4b' if numeric_val > 0 else '#00cc96'
+                colors.append(f'color: {c}; font-weight: bold')
+            except:
+                colors.append('')
+    return colors
+
 # ================= 5. UI 呈现 =================
-tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：情绪预警", "⚡ 三阶段：指令与热度", "⏱️ 核心：全景向量回测"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 一阶段：超额与风险", "🕵️ 二阶段：情绪预警", "⚡ 三阶段：指令与热度", "⏱️ 核心：全景极速回测"])
 
 with tab1:
     st.subheader("核心指标：寻找平稳高动量 (已过滤停牌/次新，异常标的自动垫底)")
@@ -370,8 +424,17 @@ with tab1:
 
 with tab2:
     st.subheader(f"连板妖股与接力情绪预警监控 (周期: {interval_option})")
+    st.caption("🔥 **透视预判：新增【同分历史预期】列，直接展示该股票历史上得同等分数时，未来 1、3、5、10 天的平均涨跌幅（红代表涨，绿代表跌）。**")
+    
     phase2_df, raw_dfs = run_phase_2(data_dict, phase1_df, param_window)
-    st.dataframe(phase2_df.style.apply(highlight_suspended, axis=1).background_gradient(subset=['综合高危得分(满分6.5)'], cmap='Reds', vmin=0, vmax=6.5), use_container_width=True)
+    
+    st.dataframe(
+        phase2_df.style
+        .apply(highlight_suspended, axis=1)
+        .apply(color_returns_col, subset=['同分1日预期', '同分3日预期', '同分5日预期', '同分10日预期'])
+        .background_gradient(subset=['综合高危得分(满分6.5)'], cmap='Reds', vmin=0, vmax=6.5), 
+        use_container_width=True
+    )
     
 with tab3:
     st.subheader("组合全局监控与仓位指令")
@@ -405,7 +468,7 @@ with tab3:
     if orders: st.dataframe(pd.DataFrame(orders), use_container_width=True)
 
 with tab4:
-    st.subheader("历史信号多维成效测算（支持双向验证）")
+    st.subheader("历史信号多维成效极速测算")
     
     col_a, col_b = st.columns(2)
     bt_score_threshold = col_a.selectbox("选择回测信号触发条件：", [
@@ -415,7 +478,6 @@ with tab4:
         "<= 2.0分 (安全持仓/低风险)",
         "== 0.0分 (完美安全/零风险绝佳点)"
     ])
-    # 核心更新：加入 1 日表现选项
     bt_period = col_b.radio("观察信号触发后表现窗口：", [1, 3, 5, 10], index=2, horizontal=True)
     
     is_safe_test = "<=" in bt_score_threshold or "==" in bt_score_threshold
@@ -426,78 +488,35 @@ with tab4:
     elif "2.0" in bt_score_threshold: bt_thresh_val = 2.0
     else: bt_thresh_val = 0.0
     
-    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **[{bt_score_threshold}]** 后 `{bt_period}` 个周期的表现。系统已开启冷却期机制以防重复计算。")
+    st.markdown(f"统计过去 `{lookback_days}` 天内，标的触发 **[{bt_score_threshold}]** 后 `{bt_period}` 个周期的表现。底层架构重构后已实现0延迟秒算。")
     
-    if st.button("▶️ 开始全量回溯计算", type="primary"):
+    if st.button("▶️ 开始全量极速回算", type="primary"):
         bt_results = []
-        with st.spinner("正在后台进行向量推演..."):
-            for ticker in phase1_df['代码'].tolist():
-                if ticker not in raw_dfs: continue
-                df_bt = raw_dfs[ticker].copy()
-                history_window = param_window * 5
+        # 由于所有计算都在 Phase 2 已经缓存完成，这里只需要做极速匹配和切片
+        for ticker in phase1_df['代码'].tolist():
+            if ticker not in raw_dfs: continue
+            df_bt = raw_dfs[ticker]  # 直接调用自带光环的 df
+            scores = df_bt['Score']
+            
+            if "==" in bt_score_threshold: signals = scores == 0.0
+            elif "<=" in bt_score_threshold: signals = scores <= bt_thresh_val
+            elif bt_thresh_val == 6.5: signals = scores >= 6.5
+            else: signals = scores >= bt_thresh_val
                 
-                df_bt['limit_up'] = df_bt['ret'] >= 0.09
-                df_bt['streak'] = df_bt['limit_up'].groupby((~df_bt['limit_up']).cumsum()).cumcount()
-                df_bt['streak'] = np.where(df_bt['limit_up'], df_bt['streak'] + 1, 0)
+            signal_dates = df_bt.index[signals]
+            
+            last_idx = -999
+            for date in signal_dates:
+                idx = df_bt.index.get_loc(date)
+                if idx - last_idx < bt_period: continue 
                 
-                was_limit_up = df_bt['streak'].shift(1) >= 1
-                was_consec_limit_up = df_bt['streak'].shift(1) >= 2
-                
-                dynamic_surge_mul = np.where(was_limit_up, 2.0, 3.0)
-                proxy_mean = df_bt['Crowd_Proxy'].rolling(param_window).mean()
-                is_surge = df_bt['Crowd_Proxy'] > (dynamic_surge_mul * proxy_mean)
-                
-                df_bt['5d_ret'] = df_bt['Close'].pct_change(5)
-                df_bt['acc'] = df_bt['5d_ret'] - df_bt['5d_ret'].rolling(param_window).mean()
-                acc_threshold = df_bt['acc'].rolling(history_window).quantile(0.90)
-                w_acc = df_bt['acc'] > acc_threshold.fillna(0.05)
-                
-                dynamic_crowd_pct = np.where((was_consec_limit_up) | (df_bt['streak'] >= 2), 0.75, param_crowd_pct)
-                vol_pct = df_bt['Crowd_Proxy'].rolling(history_window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan)
-                w_crowd = vol_pct > dynamic_crowd_pct
-                
-                df_bt['vol_ratio'] = df_bt['ret'].rolling(5).std() / (df_bt['ret'].rolling(param_window).std() + 1e-9)
-                vol_ratio_threshold = df_bt['vol_ratio'].rolling(history_window).quantile(0.90)
-                w_vol = df_bt['vol_ratio'] > vol_ratio_threshold.fillna(1.5)
-                
-                range_p = df_bt['High'] - df_bt['Low']
-                df_bt['CloseStr'] = np.where(range_p > 0, (df_bt['Close'] - df_bt['Low']) / range_p, 0.5)
-                str_3d = df_bt['CloseStr'].rolling(3).mean()
-                w_str = str_3d < 0.5 
-                
-                open_high_go_low = (df_bt['Open'] > df_bt['Close'].shift(1)) & (df_bt['Close'] < df_bt['Open'])
-                blew_board = (df_bt['High'] / df_bt['Close'].shift(1) - 1 >= 0.09) & (df_bt['Close'] < df_bt['High'])
-                early_fatal = was_limit_up & (open_high_go_low | blew_board) & is_surge
-                
-                fatal_diverge = (is_surge & ((str_3d < 0.3) | (df_bt['ret'] < -0.02))) | early_fatal
-                
-                weak_relay = (df_bt['ret'] > 0) & (df_bt['ret'] < df_bt['ret'].shift(1)) & (df_bt['CloseStr'] < 0.5) & is_surge
-                break_board = was_consec_limit_up & (~df_bt['limit_up']) & is_surge
-                
-                scores = (w_str * 1.5) + (w_acc * 1.0) + (w_crowd * 1.0) + (w_vol * 1.0) + ((is_surge & ~fatal_diverge) * 1.0)
-                scores = scores + np.where(weak_relay, 1.0, 0) + np.where(break_board, 2.0, 0)
-                scores = np.where(fatal_diverge, 6.5, scores)
-                scores = np.clip(scores, 0, 6.5)
-                
-                if "==" in bt_score_threshold: signals = scores == 0.0
-                elif "<=" in bt_score_threshold: signals = scores <= bt_thresh_val
-                elif bt_thresh_val == 6.5: signals = scores >= 6.5
-                else: signals = scores >= bt_thresh_val
+                if idx + bt_period < len(df_bt): 
+                    price_at_signal = df_bt['Close'].iloc[idx]
+                    price_after = df_bt['Close'].iloc[idx + bt_period]
+                    ret_period = (price_after / price_at_signal) - 1
+                    bt_results.append({'代码': ticker, '名称': get_stock_name(ticker), '信号日期': date.strftime("%Y-%m-%d"), '触发得分': f"{scores.iloc[idx]:.1f}", f'{bt_period}周期后表现': ret_period})
+                    last_idx = idx 
                     
-                signal_dates = df_bt.index[signals]
-                
-                last_idx = -999
-                for date in signal_dates:
-                    idx = df_bt.index.get_loc(date)
-                    if idx - last_idx < bt_period: continue 
-                    
-                    if idx + bt_period < len(df_bt): 
-                        price_at_signal = df_bt['Close'].iloc[idx]
-                        price_after = df_bt['Close'].iloc[idx + bt_period]
-                        ret_period = (price_after / price_at_signal) - 1
-                        bt_results.append({'代码': ticker, '名称': get_stock_name(ticker), '信号日期': date.strftime("%Y-%m-%d"), '触发得分': f"{scores[idx]:.1f}", f'{bt_period}周期后表现': ret_period})
-                        last_idx = idx 
-                        
         if bt_results:
             bt_df = pd.DataFrame(bt_results)
             
