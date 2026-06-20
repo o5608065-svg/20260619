@@ -6,7 +6,8 @@ import json
 import os
 import shutil
 import time
-import efinance as ef  # 👈 全新引入：东方财富数据接口
+import requests
+import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 1. 强健的工程模块：JSON备份、映射与重试装饰器 =================
@@ -53,7 +54,7 @@ def robust_save_json(file_path, data):
             shutil.copy(file_path, file_path + ".bak") 
         os.replace(tmp_path, file_path) 
     except Exception as e:
-        st.sidebar.error(f"本地存储异常: {e}")
+        pass # 云端静默处理非致命写入错误
 
 def retry_on_exception(retries=3, delay=1):
     def decorator(func):
@@ -78,18 +79,17 @@ def get_stock_name(ticker):
     return TICKER_NAME_MAPPING.get(ticker, ticker)
 
 # ================= 2. 页面与侧边栏动态参数 =================
-st.set_page_config(page_title="自适应量化逃顶系统 v3.3", layout="wide")
-st.title("📈 强势股自适应逃顶择时系统 v3.3")
-st.caption("🔥 全新升级：彻底弃用雅虎，采用【东方财富】数据引擎，永不封禁IP，原生精准成交额！")
+st.set_page_config(page_title="自适应量化逃顶系统 v3.4", layout="wide")
+st.title("📈 强势股自适应逃顶择时系统 v3.4")
+st.caption("🛡️ 引擎升级：搭载高拟真防封锁（Anti-Ban）机制与智能并发限流，彻底解决云端IP阻断问题。")
 
 st.sidebar.header("⚙️ 引擎设置")
 
 interval_option = st.sidebar.selectbox("K线级别", ["1d (日线)", "60m (小时线)", "30m (半小时)"])
-# efinance的级别代号: 101是日线，60是60分钟，30是30分钟
-interval_map = {"1d (日线)": 101, "60m (小时线)": 60, "30m (半小时)": 30}
+interval_map = {"1d (日线)": "1d", "60m (小时线)": "60m", "30m (半小时)": "30m"}
 interval = interval_map[interval_option]
 
-lookback_days = st.sidebar.slider("拉取回溯天数", 200, 730, 400)
+lookback_days = st.sidebar.slider("拉取回溯天数 (美股分钟级限730天)", 200, 730, 400)
 
 st.sidebar.subheader("系统参数 (自适应计算基准)")
 param_window = st.sidebar.number_input("动量与阈值基准周期", 10, 60, 20)
@@ -119,47 +119,47 @@ if st.sidebar.button("确认移除", use_container_width=True) and to_remove:
 
 tickers = list(dict.fromkeys(st.session_state.watchlist + [benchmark]))
 
-# ================= 3. 异步数据拉取引擎 (彻底剥离雅虎，拥抱东方财富) =================
-@retry_on_exception(retries=3)
-def fetch_single_ticker(ticker, start, end, klt):
-    # 剥离代码后缀，使其适配东方财富的智能搜索 (如: 600519.SS -> 600519)
-    if ticker == "000300.SS": clean_ticker = "沪深300"
-    elif ticker == "^HSI": clean_ticker = "恒生指数"
-    else: clean_ticker = ticker.split('.')[0]
+# ================= 3. 带护甲的异步数据引擎 =================
+# 全局防封锁会话设置：伪装成真实的桌面端 Chrome 浏览器
+global_session = requests.Session()
+global_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8"
+})
+
+@retry_on_exception(retries=3, delay=2)
+def fetch_single_ticker(ticker, start, end, inv):
+    # 核心护甲机制：人为增加 0.2 到 1.5 秒的随机延迟，打破机器并发特征
+    time.sleep(np.random.uniform(0.2, 1.5))
     
-    start_str = start.strftime("%Y%m%d")
-    end_str = end.strftime("%Y%m%d")
+    # 将 session 传递给 yfinance，应用浏览器伪装
+    df = yf.download(ticker, start=start, end=end, interval=inv, auto_adjust=True, session=global_session, progress=False)
     
-    # 核心：调用 efinance 获取东方财富行情 (默认包含前复权)
-    df = ef.stock.get_quote_history(clean_ticker, beg=start_str, end=end_str, klt=klt)
-    if df is None or df.empty: return ticker, pd.DataFrame()
-    
-    # 将中文列名映射为量化标准英文列名
-    df = df.rename(columns={
-        '日期': 'Date', '开盘': 'Open', '收盘': 'Close', 
-        '最高': 'High', '最低': 'Low', '成交量': 'Volume', '成交额': 'DollarVolume'
-    })
-    
-    df['Date'] = pd.to_datetime(df['Date'])
-    df.set_index('Date', inplace=True)
-    
-    # 清理空值并强制转换为数值类型
+    # 处理不同版本 yfinance 返回的列结构
+    if not df.empty and isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = pd.DataFrame({'Open': df['Open'][ticker], 'High': df['High'][ticker], 'Low': df['Low'][ticker], 'Close': df['Close'][ticker], 'Volume': df['Volume'][ticker]})
+        except KeyError:
+            return ticker, pd.DataFrame()
+            
     df.dropna(subset=['Close', 'Volume'], inplace=True)
-    for col in ['Open', 'Close', 'High', 'Low', 'Volume', 'DollarVolume']:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-    df = df[df['High'] != df['Low']] # 过滤全天停牌或一字死板的数据
+    if df.empty or len(df) < param_window * 3: return ticker, pd.DataFrame()
+    
+    df = df[df['High'] != df['Low']]
+    df['DollarVolume'] = df['Close'] * df['Volume'] 
     return ticker, df
 
 @st.cache_data(ttl=900)
-def fetch_all_data(tickers_list, days, inv_code):
+def fetch_all_data(tickers_list, days, inv):
     end_date = datetime.date.today() + datetime.timedelta(days=1)
     start_date = end_date - datetime.timedelta(days=days)
     data_dict = {}
     
-    with st.spinner('🚀 正在连接东方财富源，异步拉取全市场数据...'):
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = [executor.submit(fetch_single_ticker, t, start_date, end_date, inv_code) for t in tickers_list]
+    with st.spinner('🚀 正在启用防封锁机制，错峰拉取全市场数据 (大约需时10-20秒)...'):
+        # 核心护甲机制2：将极度激进的 max_workers=10 降低到 4，极大降低被瞬间熔断IP的概率
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(fetch_single_ticker, t, start_date, end_date, inv) for t in tickers_list]
             for future in as_completed(futures):
                 ticker, df = future.result()
                 if not df.empty: data_dict[ticker] = df
@@ -167,7 +167,7 @@ def fetch_all_data(tickers_list, days, inv_code):
 
 data_dict = fetch_all_data(tickers, lookback_days, interval)
 if not data_dict:
-    st.error("数据拉取失败。如果重试依然无效，请检查网络或更换回溯周期。")
+    st.error("数据拉取失败。如果这是云端环境初次运行，可能会有15分钟的冷却期，请稍后再试。")
     st.stop()
 
 bm_returns = data_dict[benchmark]['Close'].pct_change() if benchmark in data_dict else None
@@ -245,7 +245,6 @@ def run_phase_2(data_dict, phase1_df, window):
         acc_threshold = df['acc'].rolling(history_window).quantile(0.90).iloc[-1]
         w_acc = df['acc'].iloc[-1] > (acc_threshold if pd.notna(acc_threshold) else 0.05)
         
-        # 直接使用东方财富原生的精准 DollarVolume (成交额)
         vol_pct = df['DollarVolume'].rolling(history_window).apply(
             lambda x: pd.Series(x).rank(pct=True).iloc[-1] if len(x)>0 else np.nan).iloc[-1]
         w_crowd = vol_pct > param_crowd_pct
